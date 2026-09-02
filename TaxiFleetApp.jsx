@@ -1,0 +1,1367 @@
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { Car, Clock, MapPin, Fuel, AlertCircle, CheckCircle2, Plus, X, ChevronRight, Navigation, Calendar, User, LogOut, Gauge, Wallet, ArrowLeft, Lock, Camera, CreditCard, Banknote, Smartphone, Plane, Users, Unlock, Filter, XCircle, PlayCircle, Flag } from 'lucide-react';
+
+const KEY = 'taxifleet:state:v3';
+
+const seedDrivers = [
+  { id: 'd1', username: 'giorgos', password: '1111', name: 'Γιώργος Παπαδόπουλος', car: 'TAXI 1' },
+  { id: 'd2', username: 'nikos', password: '1111', name: 'Νίκος Σταύρου', car: 'TAXI 2' },
+  { id: 'd3', username: 'maria', password: '1111', name: 'Μαρία Κωνσταντίνου', car: 'TAXI 3' },
+];
+
+const initialState = {
+  drivers: seedDrivers,
+  cars: [
+    { id: 'TAXI 1', outOfService: false },
+    { id: 'TAXI 2', outOfService: false },
+    { id: 'TAXI 3', outOfService: false },
+  ],
+  shifts: [], // {id, driverId, car, date, startTime, endTime, startKm, endKm, startCash, cash, card, app, expenses, fuel, fuelReceiptPhoto, gpsStart, gpsEnd, status: 'active'|'closed'|'locked', notes}
+  bookings: [], // driver-logged completed rides during a shift: {id, shiftId, driverId, flightNumber, arrivalTime, customerName, passengers, destination, price, notes, status:'open'|'done'}
+  appointments: [], // admin-scheduled dispatch jobs: {id, date, time, durationMin, pickup, dropoff, customerName, driverId, car, status, notes,
+                     //   createdAt, assignedAt, acceptedAt, arrivedAt, completedAt}
+};
+
+const fontStack = { fontFamily: 'Inter, system-ui, sans-serif' };
+const ACCENT = '#F5B942';
+const BG = '#1C2128';
+const CARD = '#262C36';
+const BORDER = '#363D49';
+const TEXT = '#E8E6E1';
+const MUTE = '#8B92A0';
+const GREEN = '#4A9B6E';
+const RED = '#C1543C';
+
+function fmtEUR(n) { return `€${(Number(n) || 0).toFixed(2)}`; }
+function todayStr() {
+  const d = new Date();
+  return d.toLocaleDateString('el-GR');
+}
+function isoDateStr(d) {
+  // yyyy-mm-dd for stable sorting/filtering, independent of locale
+  const dt = new Date(d);
+  return dt.toISOString().slice(0, 10);
+}
+function timeToMin(t) { const [h, m] = t.split(':').map(Number); return h * 60 + m; }
+function apptRange(a) {
+  const start = timeToMin(a.time);
+  return [start, start + (a.durationMin || 60)];
+}
+function rangesOverlap(a, b) { return a[0] < b[1] && b[0] < a[1]; }
+
+// Core conflict check used both for live validation and final save-blocking.
+// Returns { ok: true } or { ok: false, reason: string }
+function checkAppointmentConflict({ appointments, shifts, cars }, { date, time, durationMin, driverId, car, excludeId }) {
+  const newRange = apptRange({ time, durationMin });
+
+  // 1. Driver already has an appointment overlapping this window
+  if (driverId) {
+    const driverConflict = appointments.find(a =>
+      a.id !== excludeId && a.driverId === driverId && a.date === date && a.status !== 'cancelled' &&
+      rangesOverlap(apptRange(a), newRange)
+    );
+    if (driverConflict) {
+      return { ok: false, reason: `Ο οδηγός έχει ήδη ανάθεση ${driverConflict.time} - ${minToTime(apptRange(driverConflict)[1])}. Επιλέξτε άλλο οδηγό ή ώρα.` };
+    }
+  }
+
+  // 2. Car already has an appointment overlapping this window
+  if (car) {
+    const carConflict = appointments.find(a =>
+      a.id !== excludeId && a.car === car && a.date === date && a.status !== 'cancelled' &&
+      rangesOverlap(apptRange(a), newRange)
+    );
+    if (carConflict) {
+      return { ok: false, reason: `Το ${car} είναι δεσμευμένο από άλλο ραντεβού (${carConflict.time}).` };
+    }
+    const carRecord = cars.find(c => c.id === car);
+    if (carRecord?.outOfService) {
+      return { ok: false, reason: `Το ${car} έχει δηλωθεί εκτός λειτουργίας.` };
+    }
+  }
+
+  // 3. Driver must have a shift that day to be assignable (soft check — only warn, not block,
+  //    since shifts may be logged same-day and admin may pre-schedule ahead of time)
+  return { ok: true };
+}
+
+function minToTime(mins) {
+  const h = Math.floor(mins / 60) % 24;
+  const m = mins % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
+
+const STATUS_META = {
+  pending: { label: 'Αναμονή', color: '#F5B942' },
+  assigned: { label: 'Ανατέθηκε', color: '#5B8DEF' },
+  accepted: { label: 'Αποδεκτό', color: '#5B8DEF' },
+  enroute: { label: 'Σε διαδρομή', color: '#5B8DEF' },
+  completed: { label: 'Ολοκληρώθηκε', color: '#4A9B6E' },
+  cancelled: { label: 'Ακυρώθηκε', color: '#8B92A0' },
+};
+
+export default function TaxiFleetApp() {
+  const [state, setState] = useState(initialState);
+  const [loaded, setLoaded] = useState(false);
+  const [session, setSession] = useState(null); // {role:'driver', driverId} | {role:'admin'}
+
+  useEffect(() => {
+    let mounted = true;
+    try {
+      const raw = localStorage.getItem(KEY);
+      if (mounted && raw) setState(JSON.parse(raw));
+    } catch (e) { /* first run */ }
+    finally { if (mounted) setLoaded(true); }
+    return () => { mounted = false; };
+  }, []);
+
+  const persist = useCallback(async (next) => {
+    setState(next);
+    try { localStorage.setItem(KEY, JSON.stringify(next)); }
+    catch (e) { console.error('storage error', e); }
+  }, []);
+
+  if (!loaded) {
+    return <div style={{ minHeight: '100vh', background: BG, display: 'flex', alignItems: 'center', justifyContent: 'center', color: TEXT, ...fontStack }}>Φόρτωση…</div>;
+  }
+
+  if (!session) {
+    return <LoginScreen drivers={state.drivers} onLogin={setSession} />;
+  }
+
+  if (session.role === 'driver') {
+    return <DriverApp state={state} persist={persist} driverId={session.driverId} onLogout={() => setSession(null)} />;
+  }
+
+  return <AdminApp state={state} persist={persist} onLogout={() => setSession(null)} />;
+}
+
+// ================= LOGIN =================
+function LoginScreen({ drivers, onLogin }) {
+  const [mode, setMode] = useState(null); // 'driver' | 'admin'
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+
+  const submitDriver = () => {
+    const d = drivers.find(x => x.username === username.trim().toLowerCase());
+    if (!d || d.password !== password) {
+      setError('Λάθος όνομα χρήστη ή κωδικός');
+      return;
+    }
+    onLogin({ role: 'driver', driverId: d.id });
+  };
+
+  const submitAdmin = () => {
+    if (username.trim().toLowerCase() === 'admin' && password === 'admin') {
+      onLogin({ role: 'admin' });
+    } else {
+      setError('Λάθος στοιχεία διαχειριστή');
+    }
+  };
+
+  return (
+    <div style={{ minHeight: '100vh', background: BG, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 24, ...fontStack }}>
+      <div style={{ width: '100%', maxWidth: 380 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 32, justifyContent: 'center' }}>
+          <div style={{ width: 44, height: 44, borderRadius: 10, background: ACCENT, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <Car size={24} color={BG} strokeWidth={2.5} />
+          </div>
+          <div>
+            <div style={{ color: TEXT, fontSize: 20, fontWeight: 700 }}>Ταξί Στόλος</div>
+            <div style={{ color: MUTE, fontSize: 13 }}>Σύνδεση</div>
+          </div>
+        </div>
+
+        {!mode ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <button onClick={() => { setMode('driver'); setError(''); }} style={btnPrimary}>
+              <span style={{ display: 'flex', alignItems: 'center', gap: 10 }}><User size={20} /> Σύνδεση οδηγού</span>
+              <ChevronRight size={20} />
+            </button>
+            <button onClick={() => { setMode('admin'); setError(''); }} style={btnSecondary}>
+              <span style={{ display: 'flex', alignItems: 'center', gap: 10 }}><Gauge size={20} /> Σύνδεση διαχειριστή</span>
+              <ChevronRight size={20} />
+            </button>
+          </div>
+        ) : (
+          <div>
+            <button onClick={() => { setMode(null); setUsername(''); setPassword(''); setError(''); }} style={btnBack}>
+              <ArrowLeft size={16} /> Πίσω
+            </button>
+            <label style={label}>Όνομα χρήστη</label>
+            <input value={username} onChange={e => setUsername(e.target.value)} style={input} placeholder={mode === 'admin' ? 'admin' : 'π.χ. giorgos'} />
+            <label style={label}>Κωδικός</label>
+            <input type="password" value={password} onChange={e => setPassword(e.target.value)} style={{ ...input, marginBottom: 8 }} onKeyDown={e => e.key === 'Enter' && (mode === 'driver' ? submitDriver() : submitAdmin())} />
+            {error && <div style={{ color: RED, fontSize: 13, marginBottom: 12 }}>{error}</div>}
+            <button
+              onClick={mode === 'driver' ? submitDriver : submitAdmin}
+              style={{ ...btnPrimary, justifyContent: 'center', marginTop: 8 }}
+            >
+              Σύνδεση
+            </button>
+            {mode === 'driver' && (
+              <div style={{ color: MUTE, fontSize: 11, marginTop: 14, textAlign: 'center' }}>Demo: giorgos / nikos / maria — κωδικός 1111</div>
+            )}
+            {mode === 'admin' && (
+              <div style={{ color: MUTE, fontSize: 11, marginTop: 14, textAlign: 'center' }}>Demo: admin / admin</div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const btnPrimary = { background: ACCENT, color: BG, border: 'none', borderRadius: 14, padding: 20, fontSize: 16, fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', boxSizing: 'border-box' };
+const btnSecondary = { background: CARD, color: TEXT, border: `1px solid ${BORDER}`, borderRadius: 14, padding: 20, fontSize: 16, fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', boxSizing: 'border-box' };
+const btnBack = { background: 'none', border: 'none', color: MUTE, display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', marginBottom: 20, fontSize: 14, padding: 0 };
+const label = { color: MUTE, fontSize: 13, display: 'block', marginBottom: 6 };
+const input = { width: '100%', background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 14, color: TEXT, fontSize: 15, marginBottom: 16, boxSizing: 'border-box', fontFamily: 'inherit' };
+
+// ================= DRIVER APP =================
+function DriverApp({ state, persist, driverId, onLogout }) {
+  const driver = state.drivers.find(d => d.id === driverId);
+  const activeShift = state.shifts.find(s => s.driverId === driverId && s.status === 'active');
+  const [screen, setScreen] = useState('home'); // home | startShift | booking | endShift | history
+
+  const startShift = async (payload) => {
+    const shift = {
+      id: 'shift_' + Date.now(),
+      driverId,
+      car: driver.car,
+      date: todayStr(),
+      startTime: new Date().toISOString(),
+      endTime: null,
+      startKm: Number(payload.startKm),
+      endKm: null,
+      startCash: Number(payload.startCash) || 0,
+      cash: null, card: null, app: null,
+      expenses: null, fuel: null, fuelReceiptPhoto: null,
+      gpsStart: payload.gps || null, gpsEnd: null,
+      status: 'active',
+      notes: '',
+    };
+    await persist({ ...state, shifts: [...state.shifts, shift] });
+    setScreen('home');
+  };
+
+  const addBooking = async (payload) => {
+    const booking = { id: 'bk_' + Date.now(), shiftId: activeShift.id, driverId, status: 'done', ...payload };
+    await persist({ ...state, bookings: [...state.bookings, booking] });
+    setScreen('history');
+  };
+
+  const closeShift = async (payload) => {
+    const next = {
+      ...state,
+      shifts: state.shifts.map(s => s.id === activeShift.id ? {
+        ...s,
+        endTime: new Date().toISOString(),
+        endKm: Number(payload.endKm),
+        cash: Number(payload.cash) || 0,
+        card: Number(payload.card) || 0,
+        app: Number(payload.app) || 0,
+        expenses: Number(payload.expenses) || 0,
+        fuel: Number(payload.fuel) || 0,
+        fuelReceiptPhoto: payload.fuelReceiptPhoto || null,
+        gpsEnd: payload.gps || null,
+        status: 'closed', // closed = waiting for admin lock/approval, driver can no longer edit
+      } : s),
+    };
+    await persist(next);
+    setScreen('home');
+  };
+
+  if (screen === 'startShift') return <StartShiftScreen driver={driver} onBack={() => setScreen('home')} onSubmit={startShift} />;
+  if (screen === 'booking') return <BookingScreen driver={driver} onBack={() => setScreen('home')} onSubmit={addBooking} />;
+  if (screen === 'endShift') return <EndShiftScreen driver={driver} shift={activeShift} onBack={() => setScreen('home')} onSubmit={closeShift} />;
+  if (screen === 'history') return <HistoryScreen state={state} driverId={driverId} onBack={() => setScreen('home')} />;
+
+  return (
+    <div style={{ minHeight: '100vh', background: BG, ...fontStack }}>
+      <div style={{ padding: '20px 20px 0', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <div>
+          <div style={{ color: MUTE, fontSize: 13 }}>{driver.car}</div>
+          <div style={{ color: TEXT, fontSize: 19, fontWeight: 700 }}>{driver.name}</div>
+        </div>
+        <button onClick={onLogout} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4, fontSize: 13 }}>
+          <LogOut size={16} /> Έξοδος
+        </button>
+      </div>
+
+      <div style={{ padding: 20 }}>
+        {activeShift ? (
+          <div style={{ background: CARD, border: `1px solid ${GREEN}`, borderRadius: 16, padding: 20, marginBottom: 20 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+              <div style={{ width: 8, height: 8, borderRadius: '50%', background: GREEN }} />
+              <span style={{ color: GREEN, fontSize: 13, fontWeight: 600 }}>Βάρδια σε εξέλιξη — {activeShift.car}</span>
+            </div>
+            <div style={{ color: TEXT, fontSize: 14 }}>Έναρξη {new Date(activeShift.startTime).toLocaleTimeString('el-GR', { hour: '2-digit', minute: '2-digit' })} · {activeShift.startKm} χλμ</div>
+            <div style={{ color: MUTE, fontSize: 13, marginBottom: 16 }}>Αρχικό ταμείο: {fmtEUR(activeShift.startCash)}</div>
+          </div>
+        ) : (
+          <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 16, padding: 20, marginBottom: 20, textAlign: 'center' }}>
+            <div style={{ color: MUTE, fontSize: 13 }}>Καμία ενεργή βάρδια</div>
+          </div>
+        )}
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <BigButton
+            label="Έναρξη Βάρδιας"
+            icon={Clock}
+            disabled={!!activeShift}
+            onClick={() => setScreen('startShift')}
+          />
+          <BigButton
+            label="Νέα Προμίσθωση"
+            icon={Plane}
+            disabled={!activeShift}
+            onClick={() => setScreen('booking')}
+          />
+          <BigButton
+            label="Ιστορικό Βαρδιών"
+            icon={Calendar}
+            onClick={() => setScreen('history')}
+          />
+          {activeShift && (
+            <button onClick={() => setScreen('endShift')} style={{ ...btnPrimary, background: RED, color: '#fff', marginTop: 8 }}>
+              <span>Κλείσιμο Βάρδιας</span>
+              <ChevronRight size={20} />
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BigButton({ label, icon: Icon, onClick, disabled }) {
+  return (
+    <button
+      onClick={disabled ? undefined : onClick}
+      disabled={disabled}
+      style={{
+        background: disabled ? '#20242c' : CARD,
+        border: `1px solid ${disabled ? '#2a2f38' : BORDER}`,
+        borderRadius: 16, padding: 22, display: 'flex', alignItems: 'center', gap: 14,
+        cursor: disabled ? 'not-allowed' : 'pointer', opacity: disabled ? 0.5 : 1,
+      }}
+    >
+      <div style={{ width: 40, height: 40, borderRadius: 10, background: disabled ? '#2a2f38' : 'rgba(245,185,66,0.12)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <Icon size={20} color={disabled ? MUTE : ACCENT} />
+      </div>
+      <span style={{ color: TEXT, fontSize: 16, fontWeight: 700 }}>{label}</span>
+      <ChevronRight size={18} color={MUTE} style={{ marginLeft: 'auto' }} />
+    </button>
+  );
+}
+
+function captureGPS() {
+  return new Promise((resolve) => {
+    if (!navigator.geolocation) return resolve(null);
+    navigator.geolocation.getCurrentPosition(
+      pos => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude, at: new Date().toISOString() }),
+      () => resolve(null),
+      { timeout: 5000 }
+    );
+  });
+}
+
+function StartShiftScreen({ driver, onBack, onSubmit }) {
+  const [startKm, setStartKm] = useState('');
+  const [startCash, setStartCash] = useState('');
+  const [gps, setGps] = useState(null);
+  const [gpsStatus, setGpsStatus] = useState('idle');
+
+  const grabGPS = async () => {
+    setGpsStatus('loading');
+    const p = await captureGPS();
+    setGps(p);
+    setGpsStatus(p ? 'ok' : 'error');
+  };
+
+  const canSubmit = startKm !== '' && startCash !== '';
+
+  return (
+    <Screen title="Έναρξη Βάρδιας" subtitle={driver.car} onBack={onBack}>
+      <Row label="Όχημα" value={driver.car} />
+      <Row label="Ημερομηνία" value={todayStr()} />
+      <Row label="Ώρα έναρξης" value={new Date().toLocaleTimeString('el-GR', { hour: '2-digit', minute: '2-digit' })} />
+
+      <label style={label}>Χιλιόμετρα έναρξης</label>
+      <input type="number" value={startKm} onChange={e => setStartKm(e.target.value)} placeholder="π.χ. 154230" style={input} />
+
+      <label style={label}>Αρχικό ταμείο (€)</label>
+      <input type="number" value={startCash} onChange={e => setStartCash(e.target.value)} placeholder="π.χ. 50" style={input} />
+
+      <GPSButton status={gpsStatus} onClick={grabGPS} gps={gps} label="Καταγραφή θέσης έναρξης (GPS)" />
+
+      <button
+        onClick={() => canSubmit && onSubmit({ startKm, startCash, gps })}
+        disabled={!canSubmit}
+        style={{ ...btnPrimary, justifyContent: 'center', marginTop: 12, opacity: canSubmit ? 1 : 0.5, cursor: canSubmit ? 'pointer' : 'not-allowed' }}
+      >
+        ✅ Έναρξη
+      </button>
+    </Screen>
+  );
+}
+
+function GPSButton({ status, onClick, gps, label }) {
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <button
+        onClick={onClick}
+        style={{
+          width: '100%', background: status === 'ok' ? 'rgba(74,155,110,0.12)' : CARD,
+          border: `1px solid ${status === 'ok' ? GREEN : BORDER}`, borderRadius: 10, padding: 14,
+          color: status === 'ok' ? GREEN : TEXT, fontSize: 14, fontWeight: 600, cursor: 'pointer',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+        }}
+      >
+        <Navigation size={16} />
+        {status === 'idle' && label}
+        {status === 'loading' && 'Λήψη θέσης…'}
+        {status === 'ok' && `Θέση καταγράφηκε (${gps.lat.toFixed(4)}, ${gps.lng.toFixed(4)})`}
+        {status === 'error' && 'Αποτυχία — δοκίμασε ξανά'}
+      </button>
+      <div style={{ color: MUTE, fontSize: 11, marginTop: 6 }}>Χρησιμοποιείται για σύγκριση με τα δηλωμένα χιλιόμετρα.</div>
+    </div>
+  );
+}
+
+function BookingScreen({ driver, onBack, onSubmit }) {
+  const [flightNumber, setFlightNumber] = useState('');
+  const [arrivalTime, setArrivalTime] = useState('');
+  const [customerName, setCustomerName] = useState('');
+  const [passengers, setPassengers] = useState('1');
+  const [destination, setDestination] = useState('');
+  const [price, setPrice] = useState('');
+  const [notes, setNotes] = useState('');
+
+  const canSubmit = customerName && destination && price;
+
+  return (
+    <Screen title="Νέα Προμίσθωση" subtitle={driver.car} onBack={onBack}>
+      <label style={label}>Αριθμός πτήσης (προαιρετικό)</label>
+      <input value={flightNumber} onChange={e => setFlightNumber(e.target.value)} placeholder="π.χ. A3 654" style={input} />
+
+      <label style={label}>Ώρα άφιξης (προαιρετικό)</label>
+      <input type="time" value={arrivalTime} onChange={e => setArrivalTime(e.target.value)} style={input} />
+
+      <label style={label}>Όνομα πελάτη</label>
+      <input value={customerName} onChange={e => setCustomerName(e.target.value)} placeholder="π.χ. Κος Αντωνίου" style={input} />
+
+      <label style={label}>Άτομα</label>
+      <input type="number" min="1" value={passengers} onChange={e => setPassengers(e.target.value)} style={input} />
+
+      <label style={label}>Προορισμός</label>
+      <input value={destination} onChange={e => setDestination(e.target.value)} placeholder="π.χ. Αεροδρόμιο" style={input} />
+
+      <label style={label}>Τιμή (€)</label>
+      <input type="number" value={price} onChange={e => setPrice(e.target.value)} placeholder="π.χ. 35" style={input} />
+
+      <label style={label}>Σημειώσεις (προαιρετικό)</label>
+      <textarea value={notes} onChange={e => setNotes(e.target.value)} rows={2} style={{ ...input, resize: 'vertical' }} />
+
+      <button
+        onClick={() => canSubmit && onSubmit({ flightNumber, arrivalTime, customerName, passengers: Number(passengers), destination, price: Number(price), notes, createdAt: new Date().toISOString() })}
+        disabled={!canSubmit}
+        style={{ ...btnPrimary, justifyContent: 'center', marginTop: 4, opacity: canSubmit ? 1 : 0.5, cursor: canSubmit ? 'pointer' : 'not-allowed' }}
+      >
+        Ολοκλήρωση
+      </button>
+    </Screen>
+  );
+}
+
+function EndShiftScreen({ driver, shift, onBack, onSubmit }) {
+  const [endKm, setEndKm] = useState('');
+  const [cash, setCash] = useState('');
+  const [card, setCard] = useState('');
+  const [app, setApp] = useState('');
+  const [expenses, setExpenses] = useState('');
+  const [fuel, setFuel] = useState('');
+  const [fuelReceiptPhoto, setFuelReceiptPhoto] = useState(null);
+  const [gps, setGps] = useState(null);
+  const [gpsStatus, setGpsStatus] = useState('idle');
+  const fileRef = useRef(null);
+
+  const grabGPS = async () => {
+    setGpsStatus('loading');
+    const p = await captureGPS();
+    setGps(p);
+    setGpsStatus(p ? 'ok' : 'error');
+  };
+
+  const handlePhoto = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => setFuelReceiptPhoto(reader.result);
+    reader.readAsDataURL(file);
+  };
+
+  const kmValid = endKm && Number(endKm) >= shift.startKm;
+  const totalRevenue = (Number(cash) || 0) + (Number(card) || 0) + (Number(app) || 0);
+  const netResult = totalRevenue - (Number(expenses) || 0) - (Number(fuel) || 0);
+  const canSubmit = kmValid && cash !== '' && card !== '' && app !== '';
+
+  return (
+    <Screen title="Κλείσιμο Βάρδιας" subtitle={`${driver.car} · ξεκίνησε στα ${shift.startKm} χλμ`} onBack={onBack}>
+      <label style={label}>Τελικά χιλιόμετρα</label>
+      <input type="number" value={endKm} onChange={e => setEndKm(e.target.value)} placeholder="π.χ. 154480" style={{ ...input, border: `1px solid ${endKm && !kmValid ? RED : BORDER}` }} />
+      {endKm && !kmValid && <div style={{ color: RED, fontSize: 12, marginTop: -12, marginBottom: 16 }}>Πρέπει να είναι ≥ {shift.startKm}</div>}
+
+      <GPSButton status={gpsStatus} onClick={grabGPS} gps={gps} label="Καταγραφή θέσης τέλους (GPS)" />
+
+      <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
+        <div style={{ flex: 1 }}>
+          <label style={label}><Banknote size={13} style={{ verticalAlign: 'middle', marginRight: 4 }} />Μετρητά</label>
+          <input type="number" value={cash} onChange={e => setCash(e.target.value)} style={{ ...input, marginBottom: 0 }} />
+        </div>
+        <div style={{ flex: 1 }}>
+          <label style={label}><CreditCard size={13} style={{ verticalAlign: 'middle', marginRight: 4 }} />Κάρτες</label>
+          <input type="number" value={card} onChange={e => setCard(e.target.value)} style={{ ...input, marginBottom: 0 }} />
+        </div>
+        <div style={{ flex: 1 }}>
+          <label style={label}><Smartphone size={13} style={{ verticalAlign: 'middle', marginRight: 4 }} />App</label>
+          <input type="number" value={app} onChange={e => setApp(e.target.value)} style={{ ...input, marginBottom: 0 }} />
+        </div>
+      </div>
+
+      <label style={{ ...label, marginTop: 16 }}>Έξοδα (€)</label>
+      <input type="number" value={expenses} onChange={e => setExpenses(e.target.value)} placeholder="π.χ. 5" style={input} />
+
+      <label style={label}>Πετρέλαιο (€)</label>
+      <input type="number" value={fuel} onChange={e => setFuel(e.target.value)} placeholder="π.χ. 25" style={input} />
+
+      <label style={label}>Φωτογραφία απόδειξης πετρελαίου</label>
+      <input type="file" accept="image/*" capture="environment" ref={fileRef} onChange={handlePhoto} style={{ display: 'none' }} />
+      <button onClick={() => fileRef.current?.click()} style={{ width: '100%', background: CARD, border: `1px dashed ${BORDER}`, borderRadius: 10, padding: 14, color: MUTE, fontSize: 14, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginBottom: 16 }}>
+        <Camera size={16} /> {fuelReceiptPhoto ? 'Αλλαγή φωτογραφίας' : 'Λήψη φωτογραφίας'}
+      </button>
+      {fuelReceiptPhoto && (
+        <img src={fuelReceiptPhoto} alt="Απόδειξη" style={{ width: '100%', borderRadius: 10, marginBottom: 16, border: `1px solid ${BORDER}` }} />
+      )}
+
+      <div style={{ background: CARD, borderRadius: 12, padding: 16, marginBottom: 20, border: `1px solid ${BORDER}` }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+          <span style={{ color: MUTE, fontSize: 13 }}>Γενικός τζίρος</span>
+          <span style={{ color: TEXT, fontSize: 14, fontWeight: 700 }}>{fmtEUR(totalRevenue)}</span>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+          <span style={{ color: MUTE, fontSize: 13 }}>Καθαρό αποτέλεσμα</span>
+          <span style={{ color: netResult >= 0 ? GREEN : RED, fontSize: 16, fontWeight: 700 }}>{fmtEUR(netResult)}</span>
+        </div>
+      </div>
+
+      <button
+        onClick={() => canSubmit && onSubmit({ endKm, cash, card, app, expenses, fuel, fuelReceiptPhoto, gps })}
+        disabled={!canSubmit}
+        style={{ ...btnPrimary, background: canSubmit ? RED : '#3A4150', color: '#fff', justifyContent: 'center', cursor: canSubmit ? 'pointer' : 'not-allowed' }}
+      >
+        Κλείσιμο Βάρδιας
+      </button>
+      <div style={{ color: MUTE, fontSize: 11, marginTop: 10, textAlign: 'center' }}>Μετά το κλείσιμο τα στοιχεία κλειδώνουν — αλλαγές μόνο με έγκριση διαχειριστή.</div>
+    </Screen>
+  );
+}
+
+function HistoryScreen({ state, driverId, onBack }) {
+  const shifts = state.shifts.filter(s => s.driverId === driverId).slice().reverse();
+  return (
+    <Screen title="Ιστορικό Βαρδιών" onBack={onBack}>
+      {shifts.length === 0 && <div style={{ color: MUTE, fontSize: 13 }}>Καμία βάρδια ακόμα</div>}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        {shifts.map(s => {
+          const revenue = (s.cash || 0) + (s.card || 0) + (s.app || 0);
+          const bookingsCount = state.bookings.filter(b => b.shiftId === s.id).length;
+          return (
+            <div key={s.id} style={{ background: CARD, borderRadius: 12, padding: 14, border: `1px solid ${BORDER}` }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                <div style={{ color: TEXT, fontSize: 14, fontWeight: 700 }}>{s.date}</div>
+                <StatusBadge status={s.status} />
+              </div>
+              <div style={{ color: MUTE, fontSize: 12, marginBottom: 8 }}>
+                {s.car} · {bookingsCount} προμισθώσεις {s.endKm ? `· ${s.endKm - s.startKm} χλμ` : ''}
+              </div>
+              {s.status !== 'active' && (
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span style={{ color: MUTE, fontSize: 12 }}>Τζίρος</span>
+                  <span style={{ color: GREEN, fontSize: 14, fontWeight: 700 }}>{fmtEUR(revenue)}</span>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </Screen>
+  );
+}
+
+function StatusBadge({ status }) {
+  const map = {
+    active: { c: GREEN, l: 'Ενεργή' },
+    closed: { c: ACCENT, l: 'Κλειστή — εκκρεμεί έλεγχος' },
+    locked: { c: MUTE, l: 'Κλειδωμένη' },
+  };
+  const m = map[status] || map.closed;
+  return (
+    <span style={{ background: `${m.c}22`, color: m.c, padding: '3px 8px', borderRadius: 6, fontSize: 11, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4 }}>
+      {status === 'locked' && <Lock size={10} />}
+      {m.l}
+    </span>
+  );
+}
+
+function Row({ label: l, value }) {
+  return (
+    <div style={{ display: 'flex', justifyContent: 'space-between', padding: '10px 0', borderBottom: `1px solid ${BORDER}`, marginBottom: 16 }}>
+      <span style={{ color: MUTE, fontSize: 13 }}>{l}</span>
+      <span style={{ color: TEXT, fontSize: 14, fontWeight: 600 }}>{value}</span>
+    </div>
+  );
+}
+
+function Screen({ title, subtitle, onBack, children }) {
+  return (
+    <div style={{ minHeight: '100vh', background: BG, ...fontStack, padding: 20 }}>
+      <button onClick={onBack} style={btnBack}><ArrowLeft size={16} /> Πίσω</button>
+      <div style={{ color: TEXT, fontSize: 20, fontWeight: 700, marginBottom: subtitle ? 4 : 20 }}>{title}</div>
+      {subtitle && <div style={{ color: MUTE, fontSize: 13, marginBottom: 20 }}>{subtitle}</div>}
+      {children}
+    </div>
+  );
+}
+
+// ================= ADMIN APP =================
+function AdminApp({ state, persist, onLogout }) {
+  const [tab, setTab] = useState('overview');
+
+  const lockShift = async (shiftId) => {
+    await persist({ ...state, shifts: state.shifts.map(s => s.id === shiftId ? { ...s, status: 'locked' } : s) });
+  };
+  const unlockShift = async (shiftId) => {
+    await persist({ ...state, shifts: state.shifts.map(s => s.id === shiftId ? { ...s, status: 'closed' } : s) });
+  };
+
+  return (
+    <div style={{ minHeight: '100vh', background: BG, ...fontStack }}>
+      <div style={{ padding: 20, display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: `1px solid ${CARD}` }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ width: 36, height: 36, borderRadius: 8, background: ACCENT, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <Gauge size={18} color={BG} strokeWidth={2.5} />
+          </div>
+          <div style={{ color: TEXT, fontSize: 17, fontWeight: 700 }}>Πίνακας διαχείρισης</div>
+        </div>
+        <button onClick={onLogout} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4, fontSize: 13 }}>
+          <LogOut size={16} /> Έξοδος
+        </button>
+      </div>
+
+      <div style={{ display: 'flex', gap: 4, padding: '16px 20px 0', overflowX: 'auto' }}>
+        {[
+          { id: 'overview', label: 'Σήμερα' },
+          { id: 'calendar', label: 'Ημερολόγιο' },
+          { id: 'appointments', label: 'Ραντεβού' },
+          { id: 'shifts', label: 'Βάρδιες' },
+          { id: 'bookings', label: 'Προμισθώσεις' },
+          { id: 'reports', label: 'Αναφορές' },
+          { id: 'fleet', label: 'Στόλος & Οδηγοί' },
+        ].map(t => (
+          <button key={t.id} onClick={() => setTab(t.id)} style={{
+            background: tab === t.id ? ACCENT : 'transparent', color: tab === t.id ? BG : MUTE,
+            border: 'none', borderRadius: 8, padding: '9px 14px', fontSize: 13, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap',
+          }}>{t.label}</button>
+        ))}
+      </div>
+
+      <div style={{ padding: 20, maxWidth: 960 }}>
+        {tab === 'overview' && <TodayTab state={state} onLock={lockShift} onUnlock={unlockShift} />}
+        {tab === 'calendar' && <CalendarTab state={state} persist={persist} />}
+        {tab === 'appointments' && <AppointmentsHistoryTab state={state} persist={persist} />}
+        {tab === 'shifts' && <AllShiftsTab state={state} onLock={lockShift} onUnlock={unlockShift} />}
+        {tab === 'bookings' && <BookingsTab state={state} />}
+        {tab === 'reports' && <ReportsTab state={state} />}
+        {tab === 'fleet' && <FleetTab state={state} persist={persist} />}
+      </div>
+    </div>
+  );
+}
+
+// ---------- Στόλος & Οδηγοί (διαχείριση) ----------
+function FleetTab({ state, persist }) {
+  const [editingDriver, setEditingDriver] = useState(null); // driver object or 'new'
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+
+  const toggleCarService = async (carId) => {
+    await persist({ ...state, cars: state.cars.map(c => c.id === carId ? { ...c, outOfService: !c.outOfService } : c) });
+  };
+
+  const addCar = async () => {
+    const label = prompt('Όνομα νέου οχήματος (π.χ. TAXI 4)');
+    if (!label) return;
+    if (state.cars.some(c => c.id === label)) { alert('Υπάρχει ήδη όχημα με αυτό το όνομα.'); return; }
+    await persist({ ...state, cars: [...state.cars, { id: label, outOfService: false }] });
+  };
+
+  const removeCar = async (carId) => {
+    const inUse = state.drivers.some(d => d.car === carId);
+    if (inUse) { alert('Δεν μπορείς να διαγράψεις όχημα που είναι ανατεθειμένο σε οδηγό. Άλλαξε πρώτα το όχημα του οδηγού.'); return; }
+    if (!confirm(`Διαγραφή ${carId};`)) return;
+    await persist({ ...state, cars: state.cars.filter(c => c.id !== carId) });
+  };
+
+  const saveDriver = async (payload) => {
+    if (payload.id) {
+      await persist({ ...state, drivers: state.drivers.map(d => d.id === payload.id ? { ...d, ...payload } : d) });
+    } else {
+      const id = 'd_' + Date.now();
+      await persist({ ...state, drivers: [...state.drivers, { id, ...payload }] });
+    }
+    setEditingDriver(null);
+  };
+
+  const removeDriver = async (driverId) => {
+    const hasShifts = state.shifts.some(s => s.driverId === driverId);
+    if (hasShifts && !confirm('Ο οδηγός έχει ιστορικό βαρδιών. Η διαγραφή δεν σβήνει το ιστορικό, αλλά ο οδηγός δεν θα εμφανίζεται πλέον στη λίστα σύνδεσης. Συνέχεια;')) return;
+    await persist({ ...state, drivers: state.drivers.filter(d => d.id !== driverId) });
+    setConfirmDeleteId(null);
+  };
+
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+        <div style={{ color: TEXT, fontSize: 15, fontWeight: 700 }}>Οχήματα</div>
+        <button onClick={addCar} style={{ background: 'none', border: `1px solid ${BORDER}`, color: TEXT, borderRadius: 8, padding: '7px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6 }}>
+          <Plus size={13} /> Νέο όχημα
+        </button>
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 28 }}>
+        {state.cars.map(c => (
+          <div key={c.id} style={{ background: CARD, borderRadius: 10, padding: '12px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', border: `1px solid ${BORDER}` }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <Car size={16} color={c.outOfService ? MUTE : ACCENT} />
+              <span style={{ color: TEXT, fontSize: 14, fontWeight: 600 }}>{c.id}</span>
+              {c.outOfService && <span style={{ background: 'rgba(193,84,60,0.15)', color: RED, padding: '2px 7px', borderRadius: 5, fontSize: 11, fontWeight: 600 }}>Εκτός λειτουργίας</span>}
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button onClick={() => toggleCarService(c.id)} style={smallBtn(c.outOfService ? GREEN : RED)}>
+                {c.outOfService ? 'Επαναφορά' : 'Εκτός λειτουργίας'}
+              </button>
+              <button onClick={() => removeCar(c.id)} style={smallBtn(MUTE)}>Διαγραφή</button>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+        <div style={{ color: TEXT, fontSize: 15, fontWeight: 700 }}>Οδηγοί</div>
+        <button onClick={() => setEditingDriver('new')} style={{ background: 'none', border: `1px solid ${BORDER}`, color: TEXT, borderRadius: 8, padding: '7px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6 }}>
+          <Plus size={13} /> Νέος οδηγός
+        </button>
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {state.drivers.map(d => (
+          <div key={d.id} style={{ background: CARD, borderRadius: 10, padding: '12px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', border: `1px solid ${BORDER}` }}>
+            <div>
+              <div style={{ color: TEXT, fontSize: 14, fontWeight: 600 }}>{d.name}</div>
+              <div style={{ color: MUTE, fontSize: 12 }}>{d.username} · {d.car}</div>
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button onClick={() => setEditingDriver(d)} style={smallBtn(ACCENT)}>Επεξεργασία</button>
+              <button onClick={() => removeDriver(d.id)} style={smallBtn(RED)}>Διαγραφή</button>
+            </div>
+          </div>
+        ))}
+        {state.drivers.length === 0 && <div style={{ color: MUTE, fontSize: 13 }}>Κανένας οδηγός</div>}
+      </div>
+
+      {editingDriver && (
+        <DriverEditModal
+          driver={editingDriver === 'new' ? null : editingDriver}
+          cars={state.cars}
+          existingUsernames={state.drivers.filter(d => d.id !== (editingDriver?.id)).map(d => d.username)}
+          onClose={() => setEditingDriver(null)}
+          onSave={saveDriver}
+        />
+      )}
+    </div>
+  );
+}
+
+function DriverEditModal({ driver, cars, existingUsernames, onClose, onSave }) {
+  const [name, setName] = useState(driver?.name || '');
+  const [username, setUsername] = useState(driver?.username || '');
+  const [password, setPassword] = useState(driver?.password || '');
+  const [car, setCar] = useState(driver?.car || cars[0]?.id || '');
+  const [error, setError] = useState('');
+
+  const submit = () => {
+    if (!name || !username || !password || !car) { setError('Συμπλήρωσε όλα τα πεδία.'); return; }
+    if (existingUsernames.includes(username.trim().toLowerCase())) { setError('Το όνομα χρήστη υπάρχει ήδη.'); return; }
+    onSave({ id: driver?.id, name, username: username.trim().toLowerCase(), password, car });
+  };
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: 20 }}>
+      <div style={{ background: BG, border: `1px solid ${BORDER}`, borderRadius: 16, padding: 24, width: '100%', maxWidth: 400 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+          <div style={{ color: TEXT, fontSize: 17, fontWeight: 700 }}>{driver ? 'Επεξεργασία οδηγού' : 'Νέος οδηγός'}</div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer' }}><X size={20} /></button>
+        </div>
+        <label style={label}>Ονοματεπώνυμο</label>
+        <input value={name} onChange={e => setName(e.target.value)} style={input} />
+        <label style={label}>Όνομα χρήστη</label>
+        <input value={username} onChange={e => setUsername(e.target.value)} style={input} />
+        <label style={label}>Κωδικός</label>
+        <input value={password} onChange={e => setPassword(e.target.value)} style={input} />
+        <label style={label}>Όχημα</label>
+        <select value={car} onChange={e => setCar(e.target.value)} style={input}>
+          {cars.map(c => <option key={c.id} value={c.id}>{c.id}</option>)}
+        </select>
+        {error && <div style={{ color: RED, fontSize: 13, marginBottom: 12 }}>{error}</div>}
+        <button onClick={submit} style={{ ...btnPrimary, justifyContent: 'center' }}>Αποθήκευση</button>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Νέο ραντεβού με έλεγχο σύγκρουσης ----------
+function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime }) {
+  const [date, setDate] = useState(defaultDate || isoDateStr(new Date()));
+  const [time, setTime] = useState(defaultTime || '10:00');
+  const [durationMin, setDurationMin] = useState('60');
+  const [customerName, setCustomerName] = useState('');
+  const [pickup, setPickup] = useState('');
+  const [dropoff, setDropoff] = useState('');
+  const [driverId, setDriverId] = useState('');
+  const [car, setCar] = useState('');
+  const [notes, setNotes] = useState('');
+  const [error, setError] = useState('');
+
+  const conflict = useMemo(() => {
+    if (!driverId && !car) return null;
+    const result = checkAppointmentConflict(state, { date, time, durationMin: Number(durationMin), driverId, car });
+    return result.ok ? null : result.reason;
+  }, [state, date, time, durationMin, driverId, car]);
+
+  const canSubmit = customerName && pickup && dropoff && date && time && !conflict;
+
+  const submit = async () => {
+    if (!canSubmit) return;
+    const finalCheck = checkAppointmentConflict(state, { date, time, durationMin: Number(durationMin), driverId, car });
+    if (!finalCheck.ok) { setError(finalCheck.reason); return; }
+    const appt = {
+      id: 'appt_' + Date.now(),
+      date, time, durationMin: Number(durationMin),
+      customerName, pickup, dropoff, driverId: driverId || null, car: car || null,
+      status: driverId || car ? 'assigned' : 'pending',
+      notes,
+      createdAt: new Date().toISOString(),
+      assignedAt: (driverId || car) ? new Date().toISOString() : null,
+      acceptedAt: null, arrivedAt: null, completedAt: null,
+    };
+    await persist({ ...state, appointments: [...state.appointments, appt] });
+    onClose();
+  };
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'flex-end', justifyContent: 'center', zIndex: 50 }}>
+      <div style={{ background: BG, border: `1px solid ${BORDER}`, borderRadius: '20px 20px 0 0', padding: 24, width: '100%', maxWidth: 480, maxHeight: '90vh', overflowY: 'auto' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+          <div style={{ color: TEXT, fontSize: 17, fontWeight: 700 }}>Νέο ραντεβού</div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer' }}><X size={20} /></button>
+        </div>
+
+        <div style={{ display: 'flex', gap: 10 }}>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Ημερομηνία</label>
+            <input type="date" value={date} onChange={e => setDate(e.target.value)} style={input} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Ώρα</label>
+            <input type="time" value={time} onChange={e => setTime(e.target.value)} style={input} />
+          </div>
+          <div style={{ width: 100 }}>
+            <label style={label}>Λεπτά</label>
+            <input type="number" value={durationMin} onChange={e => setDurationMin(e.target.value)} style={input} />
+          </div>
+        </div>
+
+        <label style={label}>Όνομα πελάτη</label>
+        <input value={customerName} onChange={e => setCustomerName(e.target.value)} style={input} placeholder="π.χ. Κος Αντωνίου" />
+
+        <div style={{ display: 'flex', gap: 10 }}>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Παραλαβή</label>
+            <input value={pickup} onChange={e => setPickup(e.target.value)} style={input} placeholder="π.χ. Αεροδρόμιο" />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Προορισμός</label>
+            <input value={dropoff} onChange={e => setDropoff(e.target.value)} style={input} placeholder="π.χ. Κέντρο" />
+          </div>
+        </div>
+
+        <label style={label}>Οδηγός (προαιρετικό)</label>
+        <select value={driverId} onChange={e => { setDriverId(e.target.value); setError(''); }} style={input}>
+          <option value="">— Χωρίς ανάθεση —</option>
+          {state.drivers.map(d => <option key={d.id} value={d.id}>{d.name} ({d.car})</option>)}
+        </select>
+
+        <label style={label}>Όχημα (προαιρετικό)</label>
+        <select value={car} onChange={e => { setCar(e.target.value); setError(''); }} style={input}>
+          <option value="">— Χωρίς όχημα —</option>
+          {state.cars.map(c => <option key={c.id} value={c.id}>{c.id}{c.outOfService ? ' (εκτός λειτουργίας)' : ''}</option>)}
+        </select>
+
+        <label style={label}>Σημειώσεις (προαιρετικό)</label>
+        <textarea value={notes} onChange={e => setNotes(e.target.value)} rows={2} style={{ ...input, resize: 'vertical' }} />
+
+        {(conflict || error) && (
+          <div style={{ background: 'rgba(193,84,60,0.12)', border: `1px solid ${RED}`, borderRadius: 10, padding: 12, marginBottom: 16, display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+            <XCircle size={16} color={RED} style={{ flexShrink: 0, marginTop: 1 }} />
+            <span style={{ color: RED, fontSize: 13 }}>{conflict || error}</span>
+          </div>
+        )}
+
+        <button onClick={submit} disabled={!canSubmit} style={{ ...btnPrimary, justifyContent: 'center', opacity: canSubmit ? 1 : 0.5, cursor: canSubmit ? 'pointer' : 'not-allowed' }}>
+          Δημιουργία ραντεβού
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Ημερολόγιο (Calendar view) ----------
+function CalendarTab({ state, persist }) {
+  const [date, setDate] = useState(isoDateStr(new Date()));
+  const [showNew, setShowNew] = useState(false);
+  const [prefillTime, setPrefillTime] = useState('10:00');
+
+  const hours = Array.from({ length: 15 }, (_, i) => 7 + i); // 07:00 - 21:00
+  const cars = state.cars.map(c => c.id);
+
+  const apptsForSlot = (car, hour) => {
+    return state.appointments.filter(a => {
+      if (a.date !== date || a.car !== car || a.status === 'cancelled') return false;
+      const [s, e] = apptRange(a);
+      return hour * 60 < e && s < (hour + 1) * 60;
+    });
+  };
+
+  const cellColor = (appts, carRecord) => {
+    if (carRecord?.outOfService) return { bg: '#3a2a2a', label: 'Εκτός λειτουργίας', text: '#c88' };
+    if (appts.length === 0) return { bg: 'rgba(74,155,110,0.12)', label: 'Διαθέσιμο', text: GREEN };
+    const a = appts[0];
+    const meta = STATUS_META[a.status] || STATUS_META.pending;
+    return { bg: `${meta.color}22`, label: `✈ ${a.dropoff}`, text: meta.color };
+  };
+
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap', gap: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <input type="date" value={date} onChange={e => setDate(e.target.value)} style={{ ...input, marginBottom: 0, width: 'auto' }} />
+        </div>
+        <button onClick={() => { setPrefillTime('10:00'); setShowNew(true); }} style={{ background: ACCENT, color: BG, border: 'none', borderRadius: 8, padding: '9px 14px', fontSize: 13, fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6 }}>
+          <Plus size={15} /> Νέο ραντεβού
+        </button>
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, marginBottom: 14, flexWrap: 'wrap' }}>
+        <Legend color={GREEN} label="Διαθέσιμο" />
+        <Legend color="#F5B942" label="Αναμονή" />
+        <Legend color="#5B8DEF" label="Ανατέθηκε / Σε διαδρομή" />
+        <Legend color={GREEN} label="Ολοκληρώθηκε" alt={GREEN} />
+        <Legend color="#c88" label="Εκτός λειτουργίας" />
+      </div>
+
+      <div style={{ overflowX: 'auto' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: `70px repeat(${cars.length}, 1fr)`, minWidth: 360 + cars.length * 120 }}>
+          <div />
+          {cars.map(c => (
+            <div key={c} style={{ color: TEXT, fontSize: 13, fontWeight: 700, textAlign: 'center', padding: '8px 4px' }}>{c}</div>
+          ))}
+          {hours.map(h => (
+            <React.Fragment key={h}>
+              <div style={{ color: MUTE, fontSize: 12, padding: '10px 6px', borderTop: `1px solid ${CARD}` }}>{String(h).padStart(2, '0')}:00</div>
+              {cars.map(c => {
+                const appts = apptsForSlot(c, h);
+                const carRecord = state.cars.find(x => x.id === c);
+                const style = cellColor(appts, carRecord);
+                return (
+                  <div
+                    key={c + h}
+                    onClick={() => { setPrefillTime(`${String(h).padStart(2, '0')}:00`); setShowNew(true); }}
+                    style={{
+                      borderTop: `1px solid ${CARD}`, background: style.bg, minHeight: 44, padding: '6px 8px',
+                      cursor: 'pointer', display: 'flex', alignItems: 'center',
+                    }}
+                    title={appts[0]?.customerName || ''}
+                  >
+                    <span style={{ color: style.text, fontSize: 11, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{style.label}</span>
+                  </div>
+                );
+              })}
+            </React.Fragment>
+          ))}
+        </div>
+      </div>
+
+      {showNew && (
+        <NewAppointmentModal state={state} persist={persist} onClose={() => setShowNew(false)} defaultDate={date} defaultTime={prefillTime} />
+      )}
+    </div>
+  );
+}
+
+function Legend({ color, label }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+      <div style={{ width: 9, height: 9, borderRadius: 3, background: color }} />
+      <span style={{ color: MUTE, fontSize: 11 }}>{label}</span>
+    </div>
+  );
+}
+
+// ---------- Ιστορικό ραντεβού με φίλτρα ----------
+function AppointmentsHistoryTab({ state, persist }) {
+  const [filterDate, setFilterDate] = useState('');
+  const [filterDriver, setFilterDriver] = useState('');
+  const [filterCar, setFilterCar] = useState('');
+  const [filterCustomer, setFilterCustomer] = useState('');
+  const [filterStatus, setFilterStatus] = useState('');
+  const [showNew, setShowNew] = useState(false);
+
+  const filtered = state.appointments
+    .filter(a => !filterDate || a.date === filterDate)
+    .filter(a => !filterDriver || a.driverId === filterDriver)
+    .filter(a => !filterCar || a.car === filterCar)
+    .filter(a => !filterCustomer || a.customerName.toLowerCase().includes(filterCustomer.toLowerCase()))
+    .filter(a => !filterStatus || a.status === filterStatus)
+    .sort((x, y) => (y.date + y.time).localeCompare(x.date + x.time));
+
+  // Χρόνοι διεκπεραίωσης (μόνο ολοκληρωμένα με πλήρη timestamps)
+  const completedWithTimes = state.appointments.filter(a => a.status === 'completed' && a.assignedAt && a.completedAt);
+  const avgExecMin = completedWithTimes.length
+    ? Math.round(completedWithTimes.reduce((sum, a) => sum + (new Date(a.completedAt) - new Date(a.assignedAt)) / 60000, 0) / completedWithTimes.length)
+    : null;
+  const withDelay = state.appointments.filter(a => a.status === 'completed' && a.time && a.arrivedAt);
+  const avgDelayMin = withDelay.length
+    ? Math.round(withDelay.reduce((sum, a) => {
+        const scheduled = new Date(`${a.date}T${a.time}:00`);
+        return sum + (new Date(a.arrivedAt) - scheduled) / 60000;
+      }, 0) / withDelay.length)
+    : null;
+
+  const updateStatus = async (id, patch) => {
+    await persist({ ...state, appointments: state.appointments.map(a => a.id === id ? { ...a, ...patch } : a) });
+  };
+
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+        <div style={{ color: TEXT, fontSize: 15, fontWeight: 700 }}>Ιστορικό ραντεβού</div>
+        <button onClick={() => setShowNew(true)} style={{ background: ACCENT, color: BG, border: 'none', borderRadius: 8, padding: '9px 14px', fontSize: 13, fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6 }}>
+          <Plus size={15} /> Νέο
+        </button>
+      </div>
+
+      {avgExecMin != null && (
+        <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
+          <StatCard icon={Clock} label="Μέσος χρόνος εκτέλεσης" value={`${avgExecMin} λεπτά`} accent={ACCENT} />
+          {avgDelayMin != null && <StatCard icon={AlertCircle} label="Μέση καθυστέρηση" value={`${avgDelayMin} λεπτά`} accent={avgDelayMin > 0 ? RED : GREEN} />}
+        </div>
+      )}
+
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 16, background: CARD, padding: 12, borderRadius: 10, border: `1px solid ${BORDER}` }}>
+        <input type="date" value={filterDate} onChange={e => setFilterDate(e.target.value)} style={{ ...input, marginBottom: 0, width: 150 }} />
+        <select value={filterDriver} onChange={e => setFilterDriver(e.target.value)} style={{ ...input, marginBottom: 0, width: 170 }}>
+          <option value="">Όλοι οι οδηγοί</option>
+          {state.drivers.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+        </select>
+        <select value={filterCar} onChange={e => setFilterCar(e.target.value)} style={{ ...input, marginBottom: 0, width: 130 }}>
+          <option value="">Όλα τα οχήματα</option>
+          {state.cars.map(c => <option key={c.id} value={c.id}>{c.id}</option>)}
+        </select>
+        <input value={filterCustomer} onChange={e => setFilterCustomer(e.target.value)} placeholder="Πελάτης…" style={{ ...input, marginBottom: 0, width: 150 }} />
+        <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)} style={{ ...input, marginBottom: 0, width: 150 }}>
+          <option value="">Όλες οι καταστάσεις</option>
+          {Object.entries(STATUS_META).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+        </select>
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {filtered.map(a => {
+          const driver = state.drivers.find(d => d.id === a.driverId);
+          const meta = STATUS_META[a.status] || STATUS_META.pending;
+          return (
+            <div key={a.id} style={{ background: CARD, borderRadius: 12, padding: 14, border: `1px solid ${BORDER}` }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                <div>
+                  <div style={{ color: TEXT, fontSize: 14, fontWeight: 700 }}>{a.date} · {a.time}</div>
+                  <div style={{ color: MUTE, fontSize: 13, marginTop: 2 }}>{a.pickup} → {a.dropoff}</div>
+                  <div style={{ color: MUTE, fontSize: 12, marginTop: 4 }}>{a.customerName}</div>
+                </div>
+                <span style={{ background: `${meta.color}22`, color: meta.color, padding: '3px 8px', borderRadius: 6, fontSize: 11, fontWeight: 600 }}>{meta.label}</span>
+              </div>
+              <div style={{ display: 'flex', gap: 14, marginTop: 8, color: MUTE, fontSize: 12 }}>
+                <span>Οδηγός: {driver?.name || '—'}</span>
+                <span>Όχημα: {a.car || '—'}</span>
+              </div>
+              {a.status !== 'completed' && a.status !== 'cancelled' && (
+                <div style={{ display: 'flex', gap: 6, marginTop: 10, flexWrap: 'wrap' }}>
+                  {a.status === 'assigned' && (
+                    <button onClick={() => updateStatus(a.id, { status: 'accepted', acceptedAt: new Date().toISOString() })} style={smallBtn('#5B8DEF')}>Αποδοχή οδηγού</button>
+                  )}
+                  {a.status === 'accepted' && (
+                    <button onClick={() => updateStatus(a.id, { status: 'enroute' })} style={smallBtn('#5B8DEF')}>Σε διαδρομή</button>
+                  )}
+                  {(a.status === 'accepted' || a.status === 'enroute') && (
+                    <button onClick={() => updateStatus(a.id, { arrivedAt: new Date().toISOString() })} style={smallBtn(ACCENT)}>Άφιξη</button>
+                  )}
+                  <button onClick={() => updateStatus(a.id, { status: 'completed', completedAt: new Date().toISOString(), arrivedAt: a.arrivedAt || new Date().toISOString() })} style={smallBtn(GREEN)}>Ολοκλήρωση</button>
+                  <button onClick={() => updateStatus(a.id, { status: 'cancelled' })} style={smallBtn(RED)}>Ακύρωση</button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {filtered.length === 0 && <div style={{ color: MUTE, fontSize: 13 }}>Κανένα ραντεβού με αυτά τα φίλτρα</div>}
+      </div>
+
+      {showNew && <NewAppointmentModal state={state} persist={persist} onClose={() => setShowNew(false)} />}
+    </div>
+  );
+}
+
+function TodayTab({ state, onLock, onUnlock }) {
+  const today = todayStr();
+  const todayShifts = state.shifts.filter(s => s.date === today);
+
+  return (
+    <div>
+      <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Σήμερα — {today}</div>
+      {todayShifts.length === 0 && <div style={{ color: MUTE, fontSize: 13 }}>Καμία βάρδια σήμερα ακόμα</div>}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        {todayShifts.map(s => {
+          const driver = state.drivers.find(d => d.id === s.driverId);
+          const revenue = (s.cash || 0) + (s.card || 0) + (s.app || 0);
+          const km = s.endKm ? s.endKm - s.startKm : null;
+          const gpsFlag = km != null && s.gpsStart && s.gpsEnd; // presence check only in prototype
+          return (
+            <div key={s.id} style={{ background: CARD, borderRadius: 14, padding: 16, border: `1px solid ${BORDER}` }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
+                <div>
+                  <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, display: 'flex', alignItems: 'center', gap: 8 }}>
+                    🚕 {s.car}
+                  </div>
+                  <div style={{ color: MUTE, fontSize: 13 }}>Οδηγός: {driver?.name}</div>
+                </div>
+                <StatusBadge status={s.status} />
+              </div>
+              <div style={{ display: 'flex', gap: 20, marginTop: 8, flexWrap: 'wrap' }}>
+                <MiniStat label="Τζίρος" value={fmtEUR(revenue)} color={GREEN} />
+                <MiniStat label="Χλμ" value={km != null ? km : '—'} />
+                <MiniStat label="Καύσιμο" value={fmtEUR(s.fuel)} />
+                {s.fuelReceiptPhoto && <MiniStat label="Απόδειξη" value="📷 επισυνάφθηκε" />}
+                {s.gpsStart && s.gpsEnd && <MiniStat label="GPS" value="✓ καταγράφηκε" color={GREEN} />}
+              </div>
+              {s.status === 'closed' && (
+                <button onClick={() => onLock(s.id)} style={{ marginTop: 12, background: 'rgba(245,185,66,0.12)', color: ACCENT, border: `1px solid ${ACCENT}`, borderRadius: 8, padding: '8px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <Lock size={13} /> Έλεγχος &amp; κλείδωμα
+                </button>
+              )}
+              {s.status === 'locked' && (
+                <button onClick={() => onUnlock(s.id)} style={{ marginTop: 12, background: 'none', color: MUTE, border: `1px solid ${BORDER}`, borderRadius: 8, padding: '8px 14px', fontSize: 12, fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <Unlock size={13} /> Ξεκλείδωμα για διόρθωση
+                </button>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function MiniStat({ label, value, color }) {
+  return (
+    <div>
+      <div style={{ color: MUTE, fontSize: 11 }}>{label}</div>
+      <div style={{ color: color || TEXT, fontSize: 14, fontWeight: 700 }}>{value}</div>
+    </div>
+  );
+}
+
+function AllShiftsTab({ state, onLock, onUnlock }) {
+  const [filterDriver, setFilterDriver] = useState('');
+  const [filterCar, setFilterCar] = useState('');
+  const [filterFrom, setFilterFrom] = useState('');
+  const [filterTo, setFilterTo] = useState('');
+
+  const sorted = state.shifts
+    .filter(s => !filterDriver || s.driverId === filterDriver)
+    .filter(s => !filterCar || s.car === filterCar)
+    .filter(s => !filterFrom || isoDateStr(s.startTime) >= filterFrom)
+    .filter(s => !filterTo || isoDateStr(s.startTime) <= filterTo)
+    .slice().sort((a, b) => new Date(b.startTime) - new Date(a.startTime));
+
+  return (
+    <div>
+      <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Όλες οι βάρδιες</div>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 16, background: CARD, padding: 12, borderRadius: 10, border: `1px solid ${BORDER}` }}>
+        <select value={filterDriver} onChange={e => setFilterDriver(e.target.value)} style={{ ...input, marginBottom: 0, width: 170 }}>
+          <option value="">Όλοι οι οδηγοί</option>
+          {state.drivers.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+        </select>
+        <select value={filterCar} onChange={e => setFilterCar(e.target.value)} style={{ ...input, marginBottom: 0, width: 130 }}>
+          <option value="">Όλα τα οχήματα</option>
+          {state.cars.map(c => <option key={c.id} value={c.id}>{c.id}</option>)}
+        </select>
+        <input type="date" value={filterFrom} onChange={e => setFilterFrom(e.target.value)} style={{ ...input, marginBottom: 0, width: 150 }} placeholder="Από" />
+        <input type="date" value={filterTo} onChange={e => setFilterTo(e.target.value)} style={{ ...input, marginBottom: 0, width: 150 }} placeholder="Έως" />
+      </div>
+      <div style={{ overflowX: 'auto' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+          <thead>
+            <tr style={{ textAlign: 'left', color: MUTE }}>
+              {['Όχημα', 'Οδηγός', 'Ημ/νία', 'Χλμ', 'Τζίρος', 'Καθαρό', 'Κατάσταση', ''].map(h => (
+                <th key={h} style={{ padding: '8px 10px', fontWeight: 500 }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map(s => {
+              const driver = state.drivers.find(d => d.id === s.driverId);
+              const revenue = s.status === 'active' ? null : (s.cash || 0) + (s.card || 0) + (s.app || 0);
+              const net = revenue != null ? revenue - (s.expenses || 0) - (s.fuel || 0) : null;
+              return (
+                <tr key={s.id} style={{ borderTop: `1px solid ${CARD}` }}>
+                  <td style={td}>{s.car}</td>
+                  <td style={td}>{driver?.name}</td>
+                  <td style={td}>{s.date}</td>
+                  <td style={td}>{s.endKm ? s.endKm - s.startKm : '—'}</td>
+                  <td style={{ ...td, color: GREEN, fontWeight: 600 }}>{revenue != null ? fmtEUR(revenue) : '—'}</td>
+                  <td style={{ ...td, color: net != null ? (net >= 0 ? GREEN : RED) : TEXT, fontWeight: 600 }}>{net != null ? fmtEUR(net) : '—'}</td>
+                  <td style={td}><StatusBadge status={s.status} /></td>
+                  <td style={td}>
+                    {s.status === 'closed' && <button onClick={() => onLock(s.id)} style={smallBtn(ACCENT)}>Κλείδωμα</button>}
+                    {s.status === 'locked' && <button onClick={() => onUnlock(s.id)} style={smallBtn(MUTE)}>Ξεκλείδωμα</button>}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        {sorted.length === 0 && <div style={{ color: MUTE, fontSize: 13, padding: '16px 0' }}>Καμία βάρδια ακόμα</div>}
+      </div>
+    </div>
+  );
+}
+const td = { padding: '10px', color: TEXT };
+const smallBtn = (color) => ({ background: 'none', border: `1px solid ${color}`, color, borderRadius: 6, padding: '5px 10px', fontSize: 11, fontWeight: 700, cursor: 'pointer' });
+
+function BookingsTab({ state }) {
+  const sorted = state.bookings.slice().sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  return (
+    <div>
+      <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Προμισθώσεις</div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {sorted.map(b => {
+          const driver = state.drivers.find(d => d.id === b.driverId);
+          return (
+            <div key={b.id} style={{ background: CARD, borderRadius: 12, padding: 14, border: `1px solid ${BORDER}` }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <div>
+                  <div style={{ color: TEXT, fontSize: 14, fontWeight: 700 }}>{b.customerName} → {b.destination}</div>
+                  <div style={{ color: MUTE, fontSize: 12, display: 'flex', gap: 10, marginTop: 4, flexWrap: 'wrap' }}>
+                    {b.flightNumber && <span><Plane size={11} style={{ verticalAlign: 'middle' }} /> {b.flightNumber} {b.arrivalTime}</span>}
+                    <span><Users size={11} style={{ verticalAlign: 'middle' }} /> {b.passengers}</span>
+                    <span>{driver?.name} · {driver?.car}</span>
+                  </div>
+                </div>
+                <div style={{ color: GREEN, fontSize: 15, fontWeight: 700 }}>{fmtEUR(b.price)}</div>
+              </div>
+              {b.notes && <div style={{ color: MUTE, fontSize: 12, marginTop: 8, borderTop: `1px solid ${BORDER}`, paddingTop: 8 }}>{b.notes}</div>}
+            </div>
+          );
+        })}
+        {sorted.length === 0 && <div style={{ color: MUTE, fontSize: 13 }}>Καμία προμίσθωση ακόμα</div>}
+      </div>
+    </div>
+  );
+}
+
+function ReportsTab({ state }) {
+  const closedOrLocked = state.shifts.filter(s => s.status !== 'active');
+  const byDriver = {};
+  const byCar = {};
+  let totalRevenue = 0, totalExpenses = 0, totalFuel = 0;
+
+  closedOrLocked.forEach(s => {
+    const revenue = (s.cash || 0) + (s.card || 0) + (s.app || 0);
+    totalRevenue += revenue;
+    totalExpenses += s.expenses || 0;
+    totalFuel += s.fuel || 0;
+    const driver = state.drivers.find(d => d.id === s.driverId);
+    const dName = driver?.name || '—';
+    byDriver[dName] = (byDriver[dName] || 0) + revenue;
+    byCar[s.car] = (byCar[s.car] || 0) + revenue;
+  });
+
+  const netProfit = totalRevenue - totalExpenses - totalFuel;
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 24 }}>
+        <StatCard icon={Wallet} label="Συνολικός τζίρος" value={fmtEUR(totalRevenue)} accent={ACCENT} />
+        <StatCard icon={Fuel} label="Καύσιμα" value={fmtEUR(totalFuel)} accent={MUTE} />
+        <StatCard icon={AlertCircle} label="Έξοδα" value={fmtEUR(totalExpenses)} accent={RED} />
+        <StatCard icon={CheckCircle2} label="Καθαρό κέρδος" value={fmtEUR(netProfit)} accent={GREEN} />
+      </div>
+
+      <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, marginBottom: 10 }}>Τζίρος ανά οδηγό</div>
+      <BarList data={byDriver} />
+
+      <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, margin: '24px 0 10px' }}>Τζίρος ανά όχημα</div>
+      <BarList data={byCar} />
+    </div>
+  );
+}
+
+function StatCard({ icon: Icon, label, value, accent }) {
+  return (
+    <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 14, padding: 16, flex: '1 1 140px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+        <Icon size={16} color={accent} />
+        <span style={{ color: MUTE, fontSize: 12 }}>{label}</span>
+      </div>
+      <div style={{ color: TEXT, fontSize: 20, fontWeight: 700 }}>{value}</div>
+    </div>
+  );
+}
+
+function BarList({ data }) {
+  const entries = Object.entries(data);
+  const max = Math.max(1, ...entries.map(([, v]) => v));
+  if (entries.length === 0) return <div style={{ color: MUTE, fontSize: 13 }}>Δεν υπάρχουν δεδομένα ακόμα</div>;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      {entries.map(([k, v]) => (
+        <div key={k}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, marginBottom: 4 }}>
+            <span style={{ color: TEXT }}>{k}</span>
+            <span style={{ color: GREEN, fontWeight: 600 }}>{fmtEUR(v)}</span>
+          </div>
+          <div style={{ background: CARD, borderRadius: 6, height: 8, overflow: 'hidden' }}>
+            <div style={{ width: `${(v / max) * 100}%`, background: ACCENT, height: '100%', borderRadius: 6 }} />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
