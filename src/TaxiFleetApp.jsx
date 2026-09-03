@@ -308,11 +308,19 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
   const activeShift = state.shifts.find(s => s.driverId === driverId && s.status === 'active');
   const [screen, setScreen] = useState('home'); // home | startShift | booking | endShift | history
 
+  const myAppointmentsToday = state.appointments.filter(a =>
+    a.driverId === driverId && a.date === isoDateStr(new Date()) && a.status !== 'completed' && a.status !== 'cancelled'
+  );
+
+  const updateApptStatus = async (id, patch) => {
+    await persist({ ...state, appointments: state.appointments.map(a => a.id === id ? { ...a, ...patch } : a) });
+  };
+
   const startShift = async (payload) => {
     const shift = {
       id: 'shift_' + Date.now(),
       driverId,
-      car: driver.car,
+      car: payload.car,
       date: todayStr(),
       startTime: new Date().toISOString(),
       endTime: null,
@@ -356,8 +364,8 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
     setScreen('home');
   };
 
-  if (screen === 'startShift') return <StartShiftScreen driver={driver} onBack={() => setScreen('home')} onSubmit={startShift} />;
-  if (screen === 'booking') return <BookingScreen driver={driver} onBack={() => setScreen('home')} onSubmit={addBooking} />;
+  if (screen === 'startShift') return <StartShiftScreen driver={driver} cars={state.cars} activeShifts={state.shifts.filter(s => s.status === 'active')} onBack={() => setScreen('home')} onSubmit={startShift} />;
+  if (screen === 'booking') return <BookingScreen driver={driver} shift={activeShift} onBack={() => setScreen('home')} onSubmit={addBooking} />;
   if (screen === 'endShift') return <EndShiftScreen driver={driver} shift={activeShift} onBack={() => setScreen('home')} onSubmit={closeShift} />;
   if (screen === 'history') return <HistoryScreen state={state} driverId={driverId} onBack={() => setScreen('home')} />;
 
@@ -365,7 +373,7 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
     <div style={{ minHeight: '100vh', background: BG, ...fontStack }}>
       <div style={{ padding: '20px 20px 0', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <div>
-          <div style={{ color: MUTE, fontSize: 13 }}>{driver.car}</div>
+          <div style={{ color: MUTE, fontSize: 13 }}>{activeShift?.car || driver.car}</div>
           <div style={{ color: TEXT, fontSize: 19, fontWeight: 700 }}>{driver.name}</div>
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
@@ -377,6 +385,40 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
       </div>
 
       <div style={{ padding: 20 }}>
+        {myAppointmentsToday.length > 0 && (
+          <div style={{ marginBottom: 20 }}>
+            <div style={{ color: TEXT, fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Αναθέσεις σήμερα</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {myAppointmentsToday.map(a => {
+                const meta = STATUS_META[a.status] || STATUS_META.pending;
+                return (
+                  <div key={a.id} style={{ background: CARD, borderRadius: 12, padding: 14, border: `1px solid ${BORDER}` }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                      <div>
+                        <div style={{ color: TEXT, fontSize: 14, fontWeight: 700 }}>{a.time} · {a.pickup} → {a.dropoff}</div>
+                        <div style={{ color: MUTE, fontSize: 12, marginTop: 2 }}>{a.customerName}</div>
+                      </div>
+                      <span style={{ background: `${meta.color}22`, color: meta.color, padding: '3px 8px', borderRadius: 6, fontSize: 11, fontWeight: 600 }}>{meta.label}</span>
+                    </div>
+                    <div style={{ display: 'flex', gap: 6, marginTop: 10, flexWrap: 'wrap' }}>
+                      {a.status === 'assigned' && (
+                        <button onClick={() => updateApptStatus(a.id, { status: 'accepted', acceptedAt: new Date().toISOString() })} style={smallBtn('#5B8DEF')}>Αποδοχή</button>
+                      )}
+                      {a.status === 'accepted' && (
+                        <button onClick={() => updateApptStatus(a.id, { status: 'enroute' })} style={smallBtn('#5B8DEF')}>Σε διαδρομή</button>
+                      )}
+                      {(a.status === 'accepted' || a.status === 'enroute') && !a.arrivedAt && (
+                        <button onClick={() => updateApptStatus(a.id, { arrivedAt: new Date().toISOString() })} style={smallBtn(ACCENT)}>Άφιξη</button>
+                      )}
+                      <button onClick={() => updateApptStatus(a.id, { status: 'completed', completedAt: new Date().toISOString(), arrivedAt: a.arrivedAt || new Date().toISOString() })} style={smallBtn(GREEN)}>Ολοκλήρωση</button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         {activeShift ? (
           <div style={{ background: CARD, border: `1px solid ${GREEN}`, borderRadius: 16, padding: 20, marginBottom: 20 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
@@ -454,7 +496,12 @@ function captureGPS() {
   });
 }
 
-function StartShiftScreen({ driver, onBack, onSubmit }) {
+function StartShiftScreen({ driver, cars, activeShifts, onBack, onSubmit }) {
+  const occupiedCarIds = new Set(activeShifts.map(s => s.car));
+  const availableCars = cars.filter(c => !c.outOfService && !occupiedCarIds.has(c.id));
+  const [selectedCar, setSelectedCar] = useState(
+    availableCars.some(c => c.id === driver.car) ? driver.car : (availableCars[0]?.id || '')
+  );
   const [startKm, setStartKm] = useState('');
   const [startCash, setStartCash] = useState('');
   const [gps, setGps] = useState(null);
@@ -467,11 +514,22 @@ function StartShiftScreen({ driver, onBack, onSubmit }) {
     setGpsStatus(p ? 'ok' : 'error');
   };
 
-  const canSubmit = startKm !== '' && startCash !== '';
+  const canSubmit = selectedCar && startKm !== '' && startCash !== '';
 
   return (
-    <Screen title="Έναρξη Βάρδιας" subtitle={driver.car} onBack={onBack}>
-      <Row label="Όχημα" value={driver.car} />
+    <Screen title="Έναρξη Βάρδιας" subtitle={selectedCar || 'Επιλογή οχήματος'} onBack={onBack}>
+      {availableCars.length === 0 ? (
+        <div style={{ background: 'rgba(193,84,60,0.12)', border: `1px solid ${RED}`, borderRadius: 10, padding: 14, color: RED, fontSize: 13, marginBottom: 16 }}>
+          Δεν υπάρχει διαθέσιμο όχημα αυτή τη στιγμή — όλα είναι είτε σε βάρδια είτε εκτός λειτουργίας.
+        </div>
+      ) : (
+        <>
+          <label style={label}>Όχημα</label>
+          <select value={selectedCar} onChange={e => setSelectedCar(e.target.value)} style={input}>
+            {availableCars.map(c => <option key={c.id} value={c.id}>{c.id}</option>)}
+          </select>
+        </>
+      )}
       <Row label="Ημερομηνία" value={todayStr()} />
       <Row label="Ώρα έναρξης" value={new Date().toLocaleTimeString('el-GR', { hour: '2-digit', minute: '2-digit' })} />
 
@@ -484,7 +542,7 @@ function StartShiftScreen({ driver, onBack, onSubmit }) {
       <GPSButton status={gpsStatus} onClick={grabGPS} gps={gps} label="Καταγραφή θέσης έναρξης (GPS)" />
 
       <button
-        onClick={() => canSubmit && onSubmit({ startKm, startCash, gps })}
+        onClick={() => canSubmit && onSubmit({ car: selectedCar, startKm, startCash, gps })}
         disabled={!canSubmit}
         style={{ ...btnPrimary, justifyContent: 'center', marginTop: 12, opacity: canSubmit ? 1 : 0.5, cursor: canSubmit ? 'pointer' : 'not-allowed' }}
       >
@@ -517,7 +575,7 @@ function GPSButton({ status, onClick, gps, label }) {
   );
 }
 
-function BookingScreen({ driver, onBack, onSubmit }) {
+function BookingScreen({ driver, shift, onBack, onSubmit }) {
   const [flightNumber, setFlightNumber] = useState('');
   const [arrivalTime, setArrivalTime] = useState('');
   const [customerName, setCustomerName] = useState('');
@@ -529,7 +587,7 @@ function BookingScreen({ driver, onBack, onSubmit }) {
   const canSubmit = customerName && destination && price;
 
   return (
-    <Screen title="Νέα Προμίσθωση" subtitle={driver.car} onBack={onBack}>
+    <Screen title="Νέα Προμίσθωση" subtitle={shift?.car || driver.car} onBack={onBack}>
       <label style={label}>Αριθμός πτήσης (προαιρετικό)</label>
       <input value={flightNumber} onChange={e => setFlightNumber(e.target.value)} placeholder="π.χ. A3 654" style={input} />
 
@@ -595,7 +653,7 @@ function EndShiftScreen({ driver, shift, onBack, onSubmit }) {
   const canSubmit = kmValid && cash !== '' && card !== '' && app !== '';
 
   return (
-    <Screen title="Κλείσιμο Βάρδιας" subtitle={`${driver.car} · ξεκίνησε στα ${shift.startKm} χλμ`} onBack={onBack}>
+    <Screen title="Κλείσιμο Βάρδιας" subtitle={`${shift.car} · ξεκίνησε στα ${shift.startKm} χλμ`} onBack={onBack}>
       <label style={label}>Τελικά χιλιόμετρα</label>
       <input type="number" value={endKm} onChange={e => setEndKm(e.target.value)} placeholder="π.χ. 154480" style={{ ...input, border: `1px solid ${endKm && !kmValid ? RED : BORDER}` }} />
       {endKm && !kmValid && <div style={{ color: RED, fontSize: 12, marginTop: -12, marginBottom: 16 }}>Πρέπει να είναι ≥ {shift.startKm}</div>}
@@ -785,6 +843,8 @@ function FleetTab({ state, persist }) {
   const [editingDriver, setEditingDriver] = useState(null); // driver object or 'new'
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
 
+  const activeShiftForCar = (carId) => state.shifts.find(s => s.car === carId && s.status === 'active');
+
   const toggleCarService = async (carId) => {
     await persist({ ...state, cars: state.cars.map(c => c.id === carId ? { ...c, outOfService: !c.outOfService } : c) });
   };
@@ -829,21 +889,31 @@ function FleetTab({ state, persist }) {
         </button>
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 28 }}>
-        {state.cars.map(c => (
+        {state.cars.map(c => {
+          const occ = activeShiftForCar(c.id);
+          const occDriver = occ && state.drivers.find(d => d.id === occ.driverId);
+          return (
           <div key={c.id} style={{ background: CARD, borderRadius: 10, padding: '12px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', border: `1px solid ${BORDER}` }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <Car size={16} color={c.outOfService ? MUTE : ACCENT} />
+              <Car size={16} color={c.outOfService ? MUTE : (occ ? GREEN : ACCENT)} />
               <span style={{ color: TEXT, fontSize: 14, fontWeight: 600 }}>{c.id}</span>
               {c.outOfService && <span style={{ background: 'rgba(193,84,60,0.15)', color: RED, padding: '2px 7px', borderRadius: 5, fontSize: 11, fontWeight: 600 }}>Εκτός λειτουργίας</span>}
+              {!c.outOfService && occ && (
+                <span style={{ background: 'rgba(74,155,110,0.15)', color: GREEN, padding: '2px 7px', borderRadius: 5, fontSize: 11, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <span style={{ width: 6, height: 6, borderRadius: '50%', background: GREEN, display: 'inline-block' }} />
+                  Ενεργός — {occDriver?.name || '—'}
+                </span>
+              )}
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
-              <button onClick={() => toggleCarService(c.id)} style={smallBtn(c.outOfService ? GREEN : RED)}>
+              <button onClick={() => toggleCarService(c.id)} disabled={!!occ} title={occ ? 'Δεν μπορεί να αλλάξει ενόσω είναι σε βάρδια' : ''} style={{ ...smallBtn(c.outOfService ? GREEN : RED), opacity: occ ? 0.4 : 1, cursor: occ ? 'not-allowed' : 'pointer' }}>
                 {c.outOfService ? 'Επαναφορά' : 'Εκτός λειτουργίας'}
               </button>
               <button onClick={() => removeCar(c.id)} style={smallBtn(MUTE)}>Διαγραφή</button>
             </div>
           </div>
-        ))}
+          );
+        })}
       </div>
 
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
@@ -1032,10 +1102,12 @@ function CalendarTab({ state, persist }) {
 
   const hours = Array.from({ length: 15 }, (_, i) => 7 + i); // 07:00 - 21:00
   const cars = state.cars.map(c => c.id);
+  const isToday = date === isoDateStr(new Date());
+  const activeShiftForCar = (carId) => state.shifts.find(s => s.car === carId && s.status === 'active');
 
   const apptsForSlot = (car, hour) => {
     return state.appointments.filter(a => {
-      if (a.date !== date || a.car !== car || a.status === 'cancelled') return false;
+      if (a.date !== date || a.car !== car || a.status === 'cancelled' || a.status === 'completed') return false;
       const [s, e] = apptRange(a);
       return hour * 60 < e && s < (hour + 1) * 60;
     });
@@ -1064,16 +1136,27 @@ function CalendarTab({ state, persist }) {
         <Legend color={GREEN} label="Διαθέσιμο" />
         <Legend color="#F5B942" label="Αναμονή" />
         <Legend color="#5B8DEF" label="Ανατέθηκε / Σε διαδρομή" />
-        <Legend color={GREEN} label="Ολοκληρώθηκε" alt={GREEN} />
         <Legend color="#c88" label="Εκτός λειτουργίας" />
       </div>
 
       <div style={{ overflowX: 'auto' }}>
         <div style={{ display: 'grid', gridTemplateColumns: `70px repeat(${cars.length}, 1fr)`, minWidth: 360 + cars.length * 120 }}>
           <div />
-          {cars.map(c => (
-            <div key={c} style={{ color: TEXT, fontSize: 13, fontWeight: 700, textAlign: 'center', padding: '8px 4px' }}>{c}</div>
-          ))}
+          {cars.map(c => {
+            const occ = isToday && activeShiftForCar(c);
+            const occDriver = occ && state.drivers.find(d => d.id === occ.driverId);
+            return (
+              <div key={c} style={{ textAlign: 'center', padding: '8px 4px' }}>
+                <div style={{ color: TEXT, fontSize: 13, fontWeight: 700 }}>{c}</div>
+                {occ && (
+                  <div style={{ color: GREEN, fontSize: 10, fontWeight: 600, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 3, marginTop: 2 }}>
+                    <span style={{ width: 5, height: 5, borderRadius: '50%', background: GREEN, display: 'inline-block' }} />
+                    {occDriver?.name || 'Ενεργός'}
+                  </div>
+                )}
+              </div>
+            );
+          })}
           {hours.map(h => (
             <React.Fragment key={h}>
               <div style={{ color: MUTE, fontSize: 12, padding: '10px 6px', borderTop: `1px solid ${CARD}` }}>{String(h).padStart(2, '0')}:00</div>
