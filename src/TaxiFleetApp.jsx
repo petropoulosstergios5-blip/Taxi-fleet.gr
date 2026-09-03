@@ -1076,21 +1076,22 @@ function DriverEditModal({ driver, cars, existingUsernames, onClose, onSave }) {
 }
 
 // ---------- Νέο ραντεβού με έλεγχο σύγκρουσης ----------
-function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime }) {
-  const [date, setDate] = useState(defaultDate || isoDateStr(new Date()));
-  const [time, setTime] = useState(defaultTime || '10:00');
-  const [durationMin, setDurationMin] = useState('60');
-  const [customerName, setCustomerName] = useState('');
-  const [pickup, setPickup] = useState('');
-  const [dropoff, setDropoff] = useState('');
-  const [driverId, setDriverId] = useState('');
-  const [car, setCar] = useState('');
-  const [notes, setNotes] = useState('');
+function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime, appointment }) {
+  const isEdit = !!appointment;
+  const [date, setDate] = useState(appointment?.date || defaultDate || isoDateStr(new Date()));
+  const [time, setTime] = useState(appointment?.time || defaultTime || '10:00');
+  const [durationMin, setDurationMin] = useState(String(appointment?.durationMin || 60));
+  const [customerName, setCustomerName] = useState(appointment?.customerName || '');
+  const [pickup, setPickup] = useState(appointment?.pickup || '');
+  const [dropoff, setDropoff] = useState(appointment?.dropoff || '');
+  const [driverId, setDriverId] = useState(appointment?.driverId || '');
+  const [car, setCar] = useState(appointment?.car || '');
+  const [notes, setNotes] = useState(appointment?.notes || '');
   const [error, setError] = useState('');
 
   const conflict = useMemo(() => {
     if (!driverId && !car) return null;
-    const result = checkAppointmentConflict(state, { date, time, durationMin: Number(durationMin), driverId, car });
+    const result = checkAppointmentConflict(state, { date, time, durationMin: Number(durationMin), driverId, car, excludeId: appointment?.id });
     return result.ok ? null : result.reason;
   }, [state, date, time, durationMin, driverId, car]);
 
@@ -1098,19 +1099,36 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
 
   const submit = async () => {
     if (!canSubmit) return;
-    const finalCheck = checkAppointmentConflict(state, { date, time, durationMin: Number(durationMin), driverId, car });
+    const finalCheck = checkAppointmentConflict(state, { date, time, durationMin: Number(durationMin), driverId, car, excludeId: appointment?.id });
     if (!finalCheck.ok) { setError(finalCheck.reason); return; }
-    const appt = {
-      id: 'appt_' + Date.now(),
-      date, time, durationMin: Number(durationMin),
-      customerName, pickup, dropoff, driverId: driverId || null, car: car || null,
-      status: driverId || car ? 'assigned' : 'pending',
-      notes,
-      createdAt: new Date().toISOString(),
-      assignedAt: (driverId || car) ? new Date().toISOString() : null,
-      acceptedAt: null, arrivedAt: null, completedAt: null,
-    };
-    await persist({ ...state, appointments: [...state.appointments, appt] });
+
+    if (isEdit) {
+      const wasUnassigned = !appointment.driverId && !appointment.car;
+      const nowAssigned = !!(driverId || car);
+      await persist({
+        ...state,
+        appointments: state.appointments.map(a => a.id === appointment.id ? {
+          ...a,
+          date, time, durationMin: Number(durationMin),
+          customerName, pickup, dropoff, driverId: driverId || null, car: car || null,
+          notes,
+          status: wasUnassigned && nowAssigned ? 'assigned' : a.status,
+          assignedAt: wasUnassigned && nowAssigned ? new Date().toISOString() : a.assignedAt,
+        } : a),
+      });
+    } else {
+      const appt = {
+        id: 'appt_' + Date.now(),
+        date, time, durationMin: Number(durationMin),
+        customerName, pickup, dropoff, driverId: driverId || null, car: car || null,
+        status: driverId || car ? 'assigned' : 'pending',
+        notes,
+        createdAt: new Date().toISOString(),
+        assignedAt: (driverId || car) ? new Date().toISOString() : null,
+        acceptedAt: null, arrivedAt: null, completedAt: null,
+      };
+      await persist({ ...state, appointments: [...state.appointments, appt] });
+    }
     onClose();
   };
 
@@ -1118,7 +1136,7 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'flex-end', justifyContent: 'center', zIndex: 50 }}>
       <div style={{ background: BG, border: `1px solid ${BORDER}`, borderRadius: '20px 20px 0 0', padding: 24, width: '100%', maxWidth: 480, maxHeight: '90vh', overflowY: 'auto' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
-          <div style={{ color: TEXT, fontSize: 17, fontWeight: 700 }}>Νέο ραντεβού</div>
+          <div style={{ color: TEXT, fontSize: 17, fontWeight: 700 }}>{isEdit ? 'Επεξεργασία ραντεβού' : 'Νέο ραντεβού'}</div>
           <button onClick={onClose} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer' }}><X size={20} /></button>
         </div>
 
@@ -1174,7 +1192,7 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
         )}
 
         <button onClick={submit} disabled={!canSubmit} style={{ ...btnPrimary, justifyContent: 'center', opacity: canSubmit ? 1 : 0.5, cursor: canSubmit ? 'pointer' : 'not-allowed' }}>
-          Δημιουργία ραντεβού
+          {isEdit ? 'Αποθήκευση αλλαγών' : 'Δημιουργία ραντεβού'}
         </button>
       </div>
     </div>
@@ -1294,6 +1312,7 @@ function AppointmentsHistoryTab({ state, persist }) {
   const [filterCustomer, setFilterCustomer] = useState('');
   const [filterStatus, setFilterStatus] = useState('');
   const [showNew, setShowNew] = useState(false);
+  const [editingAppt, setEditingAppt] = useState(null);
 
   const filtered = state.appointments
     .filter(a => !filterDate || a.date === filterDate)
@@ -1371,21 +1390,24 @@ function AppointmentsHistoryTab({ state, persist }) {
                 <span>Οδηγός: {driver?.name || '—'}</span>
                 <span>Όχημα: {a.car || '—'}</span>
               </div>
-              {a.status !== 'completed' && a.status !== 'cancelled' && (
-                <div style={{ display: 'flex', gap: 6, marginTop: 10, flexWrap: 'wrap' }}>
-                  {a.status === 'assigned' && (
-                    <button onClick={() => updateStatus(a.id, { status: 'accepted', acceptedAt: new Date().toISOString() })} style={smallBtn('#5B8DEF')}>Αποδοχή οδηγού</button>
-                  )}
-                  {a.status === 'accepted' && (
-                    <button onClick={() => updateStatus(a.id, { status: 'enroute' })} style={smallBtn('#5B8DEF')}>Σε διαδρομή</button>
-                  )}
-                  {(a.status === 'accepted' || a.status === 'enroute') && (
-                    <button onClick={() => updateStatus(a.id, { arrivedAt: new Date().toISOString() })} style={smallBtn(ACCENT)}>Άφιξη</button>
-                  )}
-                  <button onClick={() => updateStatus(a.id, { status: 'completed', completedAt: new Date().toISOString(), arrivedAt: a.arrivedAt || new Date().toISOString() })} style={smallBtn(GREEN)}>Ολοκλήρωση</button>
-                  <button onClick={() => updateStatus(a.id, { status: 'cancelled' })} style={smallBtn(RED)}>Ακύρωση</button>
-                </div>
-              )}
+              <div style={{ display: 'flex', gap: 6, marginTop: 10, flexWrap: 'wrap' }}>
+                {a.status !== 'completed' && a.status !== 'cancelled' && (
+                  <>
+                    {a.status === 'assigned' && (
+                      <button onClick={() => updateStatus(a.id, { status: 'accepted', acceptedAt: new Date().toISOString() })} style={smallBtn('#5B8DEF')}>Αποδοχή οδηγού</button>
+                    )}
+                    {a.status === 'accepted' && (
+                      <button onClick={() => updateStatus(a.id, { status: 'enroute' })} style={smallBtn('#5B8DEF')}>Σε διαδρομή</button>
+                    )}
+                    {(a.status === 'accepted' || a.status === 'enroute') && (
+                      <button onClick={() => updateStatus(a.id, { arrivedAt: new Date().toISOString() })} style={smallBtn(ACCENT)}>Άφιξη</button>
+                    )}
+                    <button onClick={() => updateStatus(a.id, { status: 'completed', completedAt: new Date().toISOString(), arrivedAt: a.arrivedAt || new Date().toISOString() })} style={smallBtn(GREEN)}>Ολοκλήρωση</button>
+                    <button onClick={() => updateStatus(a.id, { status: 'cancelled' })} style={smallBtn(RED)}>Ακύρωση</button>
+                  </>
+                )}
+                <button onClick={() => setEditingAppt(a)} style={smallBtn(MUTE)}>Επεξεργασία</button>
+              </div>
             </div>
           );
         })}
@@ -1393,6 +1415,7 @@ function AppointmentsHistoryTab({ state, persist }) {
       </div>
 
       {showNew && <NewAppointmentModal state={state} persist={persist} onClose={() => setShowNew(false)} />}
+      {editingAppt && <NewAppointmentModal state={state} persist={persist} appointment={editingAppt} onClose={() => setEditingAppt(null)} />}
     </div>
   );
 }
