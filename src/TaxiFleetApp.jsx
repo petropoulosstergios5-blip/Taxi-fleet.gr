@@ -316,6 +316,34 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
     await persist({ ...state, appointments: state.appointments.map(a => a.id === id ? { ...a, ...patch } : a) });
   };
 
+  // Live location — only while the app is open in the foreground and a shift is active.
+  // A ref holds the latest state so the interval always writes on top of current data,
+  // not a stale snapshot from when the effect first ran.
+  const stateRef = useRef(state);
+  useEffect(() => { stateRef.current = state; }, [state]);
+  useEffect(() => {
+    if (!activeShift) return;
+    let cancelled = false;
+    const tick = async () => {
+      const pos = await captureGPS();
+      if (cancelled || !pos) return;
+      const cur = stateRef.current;
+      const shiftNow = cur.shifts.find(s => s.id === activeShift.id);
+      if (!shiftNow || shiftNow.status !== 'active') return;
+      await persist({
+        ...cur,
+        shifts: cur.shifts.map(s => s.id === activeShift.id ? { ...s, currentLocation: { lat: pos.lat, lng: pos.lng, at: pos.at } } : s),
+      });
+    };
+    tick();
+    const id = setInterval(tick, 20000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [activeShift?.id]);
+
+  const navigateTo = (address) => {
+    window.open(`https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(address)}&travelmode=driving`, '_blank');
+  };
+
   const startShift = async (payload) => {
     const shift = {
       id: 'shift_' + Date.now(),
@@ -401,6 +429,9 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
                       <span style={{ background: `${meta.color}22`, color: meta.color, padding: '3px 8px', borderRadius: 6, fontSize: 11, fontWeight: 600 }}>{meta.label}</span>
                     </div>
                     <div style={{ display: 'flex', gap: 6, marginTop: 10, flexWrap: 'wrap' }}>
+                      <button onClick={() => navigateTo(a.arrivedAt ? a.dropoff : a.pickup)} style={smallBtn('#5B8DEF')}>
+                        🧭 Πλοήγηση προς {a.arrivedAt ? 'προορισμό' : 'επιβίβαση'}
+                      </button>
                       {a.status === 'assigned' && (
                         <button onClick={() => updateApptStatus(a.id, { status: 'accepted', acceptedAt: new Date().toISOString() })} style={smallBtn('#5B8DEF')}>Αποδοχή</button>
                       )}
@@ -811,6 +842,7 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
       <div style={{ display: 'flex', gap: 4, padding: '16px 20px 0', overflowX: 'auto' }}>
         {[
           { id: 'overview', label: 'Σήμερα' },
+          { id: 'map', label: 'Χάρτης' },
           { id: 'calendar', label: 'Ημερολόγιο' },
           { id: 'appointments', label: 'Ραντεβού' },
           { id: 'shifts', label: 'Βάρδιες' },
@@ -827,6 +859,7 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
 
       <div style={{ padding: 20, maxWidth: 960 }}>
         {tab === 'overview' && <TodayTab state={state} onLock={lockShift} onUnlock={unlockShift} />}
+        {tab === 'map' && <FleetMapTab state={state} />}
         {tab === 'calendar' && <CalendarTab state={state} persist={persist} />}
         {tab === 'appointments' && <AppointmentsHistoryTab state={state} persist={persist} />}
         {tab === 'shifts' && <AllShiftsTab state={state} onLock={lockShift} onUnlock={unlockShift} />}
@@ -834,6 +867,60 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
         {tab === 'reports' && <ReportsTab state={state} />}
         {tab === 'fleet' && <FleetTab state={state} persist={persist} />}
       </div>
+    </div>
+  );
+}
+
+// ---------- Χάρτης στόλου (ζωντανές θέσεις, OpenStreetMap — χωρίς κλειδί API) ----------
+function FleetMapTab({ state }) {
+  const mapDivRef = useRef(null);
+  const mapRef = useRef(null);
+  const markersRef = useRef({});
+
+  const activeShifts = state.shifts.filter(s => s.status === 'active' && s.currentLocation);
+  const positionsKey = activeShifts.map(s => `${s.id}:${s.currentLocation.lat.toFixed(5)}:${s.currentLocation.lng.toFixed(5)}`).join('|');
+
+  useEffect(() => {
+    if (!window.L || !mapDivRef.current || mapRef.current) return;
+    mapRef.current = window.L.map(mapDivRef.current).setView([40.6401, 22.9444], 12); // Θεσσαλονίκη ως προεπιλογή
+    window.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap',
+      maxZoom: 19,
+    }).addTo(mapRef.current);
+  }, []);
+
+  useEffect(() => {
+    if (!mapRef.current || !window.L) return;
+    const liveIds = new Set(activeShifts.map(s => s.id));
+    Object.keys(markersRef.current).forEach(id => {
+      if (!liveIds.has(id)) { mapRef.current.removeLayer(markersRef.current[id]); delete markersRef.current[id]; }
+    });
+    const pts = [];
+    activeShifts.forEach(s => {
+      const driver = state.drivers.find(d => d.id === s.driverId);
+      const { lat, lng, at } = s.currentLocation;
+      pts.push([lat, lng]);
+      const ageMin = Math.max(0, Math.round((Date.now() - new Date(at).getTime()) / 60000));
+      const html = `<b>${s.car}</b><br/>${driver?.name || ''}<br/>ενημέρωση πριν ${ageMin} λεπτά`;
+      if (markersRef.current[s.id]) {
+        markersRef.current[s.id].setLatLng([lat, lng]).setPopupContent(html);
+      } else {
+        markersRef.current[s.id] = window.L.marker([lat, lng]).addTo(mapRef.current).bindPopup(html);
+      }
+    });
+    if (pts.length > 0) mapRef.current.fitBounds(pts, { maxZoom: 15, padding: [30, 30] });
+  }, [positionsKey]);
+
+  return (
+    <div>
+      <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Χάρτης στόλου (ζωντανά)</div>
+      <div style={{ color: MUTE, fontSize: 12, marginBottom: 12 }}>Η θέση ενημερώνεται μόνο όσο ο οδηγός έχει ανοιχτή την εφαρμογή στο κινητό του.</div>
+      {activeShifts.length === 0 && (
+        <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 12, padding: 16, color: MUTE, fontSize: 13, marginBottom: 12 }}>
+          Κανένα ενεργό όχημα αυτή τη στιγμή.
+        </div>
+      )}
+      <div ref={mapDivRef} style={{ width: '100%', height: 440, borderRadius: 12, overflow: 'hidden', border: `1px solid ${BORDER}` }} />
     </div>
   );
 }
