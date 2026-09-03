@@ -1,0 +1,10 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "app.vercel.taxi_fleet_gr.twa",
+      "sha256_cert_fingerprints": ["8D:71:94:BA:7D:E6:0C:5B:93:A8:95:73:8E:2C:6F:36:FB:6D:FF:30:70:F0:5D:10:62:5E:EC:3B:BD:03:76:BA"]
+    }
+  }
+]
