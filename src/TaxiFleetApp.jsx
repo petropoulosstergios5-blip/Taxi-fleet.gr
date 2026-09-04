@@ -23,6 +23,31 @@ async function uploadFuelReceipt(file) {
   return data.publicUrl;
 }
 
+// Highest odometer reading ever logged for a car, from driver shift records.
+function getCarCurrentKm(state, carId) {
+  let max = 0;
+  state.shifts.forEach(s => {
+    if (s.car !== carId) return;
+    if (s.endKm != null && s.endKm > max) max = s.endKm;
+    if (s.startKm != null && s.startKm > max) max = s.startKm;
+  });
+  return max;
+}
+
+// Service due status for a car, given its current odometer reading.
+function getServiceStatus(car, currentKm) {
+  if (!car.serviceIntervalKm) return null;
+  const base = car.lastServiceKm || 0;
+  const nextDue = base + Number(car.serviceIntervalKm);
+  const remaining = nextDue - currentKm;
+  return {
+    nextDue,
+    remaining,
+    due: remaining <= 0,
+    dueSoon: remaining > 0 && remaining <= 1000,
+  };
+}
+
 const seedDrivers = [
   { id: 'd1', username: 'giorgos', password: '1111', name: 'Γιώργος Παπαδόπουλος', car: 'TAXI 1' },
   { id: 'd2', username: 'nikos', password: '1111', name: 'Νίκος Σταύρου', car: 'TAXI 2' },
@@ -32,9 +57,9 @@ const seedDrivers = [
 const initialState = {
   drivers: seedDrivers,
   cars: [
-    { id: 'TAXI 1', outOfService: false },
-    { id: 'TAXI 2', outOfService: false },
-    { id: 'TAXI 3', outOfService: false },
+    { id: 'TAXI 1', outOfService: false, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [] },
+    { id: 'TAXI 2', outOfService: false, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [] },
+    { id: 'TAXI 3', outOfService: false, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [] },
   ],
   shifts: [], // {id, driverId, car, date, startTime, endTime, startKm, endKm, startCash, cash, card, app, expenses, fuel, fuelReceiptPhoto, gpsStart, gpsEnd, status: 'active'|'closed'|'locked', notes}
   bookings: [], // driver-logged completed rides during a shift: {id, shiftId, driverId, flightNumber, arrivalTime, customerName, passengers, destination, price, notes, status:'open'|'done'}
@@ -71,6 +96,18 @@ function rangesOverlap(a, b) { return a[0] < b[1] && b[0] < a[1]; }
 
 // Core conflict check used both for live validation and final save-blocking.
 // Returns { ok: true } or { ok: false, reason: string }
+// Current odometer reading for a car = the highest km ever logged against it,
+// across all shifts (closed shifts' endKm, or an active shift's startKm if higher).
+function getCarCurrentKm(state, carId) {
+  let max = 0;
+  for (const s of state.shifts) {
+    if (s.car !== carId) continue;
+    if (s.endKm != null && s.endKm > max) max = s.endKm;
+    if (s.startKm != null && s.startKm > max) max = s.startKm;
+  }
+  return max;
+}
+
 function checkAppointmentConflict({ appointments, shifts, cars }, { date, time, durationMin, driverId, car, excludeId }) {
   const newRange = apptRange({ time, durationMin });
 
@@ -893,6 +930,7 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
           { id: 'bookings', label: 'Προμισθώσεις' },
           { id: 'reports', label: 'Αναφορές' },
           { id: 'fleet', label: 'Στόλος & Οδηγοί' },
+          { id: 'maintenance', label: 'Service' },
         ].map(t => (
           <button key={t.id} onClick={() => setTab(t.id)} style={{
             background: tab === t.id ? ACCENT : 'transparent', color: tab === t.id ? BG : MUTE,
@@ -910,6 +948,7 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
         {tab === 'bookings' && <BookingsTab state={state} />}
         {tab === 'reports' && <ReportsTab state={state} />}
         {tab === 'fleet' && <FleetTab state={state} persist={persist} />}
+        {tab === 'maintenance' && <MaintenanceTab state={state} persist={persist} />}
       </div>
     </div>
   );
@@ -969,6 +1008,129 @@ function FleetMapTab({ state }) {
   );
 }
 
+// ---------- Service οχημάτων ----------
+const SERVICE_INTERVAL_OPTIONS = [5000, 7500, 10000, 12000, 15000, 20000, 25000, 30000];
+
+function MaintenanceTab({ state, persist }) {
+  const [openFormFor, setOpenFormFor] = useState(null); // car id whose "add service" form is open
+  const [svcDate, setSvcDate] = useState(isoDateStr(new Date()));
+  const [svcKm, setSvcKm] = useState('');
+  const [svcDesc, setSvcDesc] = useState('');
+  const [svcCost, setSvcCost] = useState('');
+
+  const setInterval_ = async (carId, km) => {
+    await persist({ ...state, cars: state.cars.map(c => c.id === carId ? { ...c, serviceIntervalKm: Number(km) } : c) });
+  };
+
+  const openForm = (carId, defaultKm) => {
+    setOpenFormFor(carId);
+    setSvcDate(isoDateStr(new Date()));
+    setSvcKm(String(defaultKm));
+    setSvcDesc('');
+    setSvcCost('');
+  };
+
+  const saveService = async (carId) => {
+    if (!svcKm || !svcDate) return;
+    const record = { id: 'svc_' + Date.now(), date: svcDate, km: Number(svcKm), description: svcDesc, cost: svcCost === '' ? null : Number(svcCost) };
+    await persist({
+      ...state,
+      cars: state.cars.map(c => c.id === carId
+        ? { ...c, lastServiceKm: Number(svcKm), serviceHistory: [record, ...(c.serviceHistory || [])] }
+        : c),
+    });
+    setOpenFormFor(null);
+  };
+
+  return (
+    <div>
+      <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Service οχημάτων</div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        {state.cars.map(c => {
+          const currentKm = getCarCurrentKm(state, c.id);
+          const lastServiceKm = c.lastServiceKm || 0;
+          const interval = c.serviceIntervalKm || 10000;
+          const sinceService = Math.max(0, currentKm - lastServiceKm);
+          const ratio = interval > 0 ? sinceService / interval : 0;
+          const status = ratio >= 1 ? 'due' : ratio >= 0.9 ? 'soon' : 'ok';
+          const statusMeta = {
+            due: { color: RED, label: '⚠ Χρειάζεται service' },
+            soon: { color: ACCENT, label: 'Πλησιάζει service' },
+            ok: { color: GREEN, label: 'OK' },
+          }[status];
+          const history = c.serviceHistory || [];
+
+          return (
+            <div key={c.id} style={{ background: CARD, borderRadius: 12, padding: 16, border: `1px solid ${status === 'due' ? RED : BORDER}` }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                <div style={{ color: TEXT, fontSize: 15, fontWeight: 700 }}>{c.id}</div>
+                <span style={{ background: `${statusMeta.color}22`, color: statusMeta.color, padding: '3px 9px', borderRadius: 6, fontSize: 12, fontWeight: 700 }}>{statusMeta.label}</span>
+              </div>
+
+              <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap', marginBottom: 10 }}>
+                <MiniStat label="Τρέχοντα χλμ" value={currentKm.toLocaleString('el-GR')} />
+                <MiniStat label="Τελευταίο service" value={lastServiceKm ? `${lastServiceKm.toLocaleString('el-GR')} χλμ` : '—'} />
+                <MiniStat label="Από τελευταίο service" value={`${sinceService.toLocaleString('el-GR')} / ${interval.toLocaleString('el-GR')} χλμ`} color={statusMeta.color} />
+              </div>
+
+              <div style={{ background: BORDER, borderRadius: 6, height: 6, overflow: 'hidden', marginBottom: 14 }}>
+                <div style={{ width: `${Math.min(100, ratio * 100)}%`, height: '100%', background: statusMeta.color }} />
+              </div>
+
+              <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginBottom: 10 }}>
+                <label style={{ color: MUTE, fontSize: 12 }}>Ειδοποίηση κάθε</label>
+                <select value={interval} onChange={e => setInterval_(c.id, e.target.value)} style={{ ...input, marginBottom: 0, width: 'auto', padding: '6px 10px' }}>
+                  {SERVICE_INTERVAL_OPTIONS.map(km => <option key={km} value={km}>{km.toLocaleString('el-GR')} χλμ</option>)}
+                </select>
+                <button onClick={() => openForm(c.id, currentKm)} style={smallBtn(ACCENT)}>+ Καταχώριση service</button>
+              </div>
+
+              {openFormFor === c.id && (
+                <div style={{ background: BG, borderRadius: 10, padding: 12, marginBottom: 10, border: `1px solid ${BORDER}` }}>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+                    <div>
+                      <label style={label}>Ημερομηνία</label>
+                      <input type="date" value={svcDate} onChange={e => setSvcDate(e.target.value)} style={{ ...input, marginBottom: 0 }} />
+                    </div>
+                    <div>
+                      <label style={label}>Χλμ κατά το service</label>
+                      <input type="number" value={svcKm} onChange={e => setSvcKm(e.target.value)} style={{ ...input, marginBottom: 0 }} />
+                    </div>
+                    <div>
+                      <label style={label}>Κόστος (€)</label>
+                      <input type="number" value={svcCost} onChange={e => setSvcCost(e.target.value)} style={{ ...input, marginBottom: 0 }} placeholder="προαιρετικό" />
+                    </div>
+                  </div>
+                  <label style={label}>Περιγραφή</label>
+                  <input value={svcDesc} onChange={e => setSvcDesc(e.target.value)} style={input} placeholder="π.χ. Αλλαγή λαδιών, φίλτρα" />
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <button onClick={() => saveService(c.id)} style={smallBtn(GREEN)}>Αποθήκευση</button>
+                    <button onClick={() => setOpenFormFor(null)} style={smallBtn(MUTE)}>Άκυρο</button>
+                  </div>
+                </div>
+              )}
+
+              {history.length > 0 && (
+                <div>
+                  <div style={{ color: MUTE, fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Ιστορικό service</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {history.map(h => (
+                      <div key={h.id} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: MUTE, borderTop: `1px solid ${BORDER}`, paddingTop: 6 }}>
+                        <span>{h.date} · {h.km.toLocaleString('el-GR')} χλμ{h.description ? ` · ${h.description}` : ''}</span>
+                        {h.cost != null && <span>{fmtEUR(h.cost)}</span>}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 // ---------- Στόλος & Οδηγοί (διαχείριση) ----------
 function FleetTab({ state, persist }) {
   const [editingDriver, setEditingDriver] = useState(null); // driver object or 'new'
@@ -984,7 +1146,7 @@ function FleetTab({ state, persist }) {
     const label = prompt('Όνομα νέου οχήματος (π.χ. TAXI 4)');
     if (!label) return;
     if (state.cars.some(c => c.id === label)) { alert('Υπάρχει ήδη όχημα με αυτό το όνομα.'); return; }
-    await persist({ ...state, cars: [...state.cars, { id: label, outOfService: false }] });
+    await persist({ ...state, cars: [...state.cars, { id: label, outOfService: false, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [] }] });
   };
 
   const removeCar = async (carId) => {
@@ -1214,15 +1376,40 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
         </div>
 
         <label style={label}>Οδηγός (προαιρετικό)</label>
-        <select value={driverId} onChange={e => { setDriverId(e.target.value); setError(''); }} style={input}>
+        <select
+          value={driverId}
+          onChange={e => {
+            const nextDriverId = e.target.value;
+            setDriverId(nextDriverId);
+            setError('');
+            const activeShift = state.shifts.find(s => s.driverId === nextDriverId && s.status === 'active');
+            if (activeShift) setCar(activeShift.car);
+          }}
+          style={input}
+        >
           <option value="">— Χωρίς ανάθεση —</option>
-          {state.drivers.map(d => <option key={d.id} value={d.id}>{d.name} ({d.car})</option>)}
+          {state.drivers.map(d => {
+            const activeShift = state.shifts.find(s => s.driverId === d.id && s.status === 'active');
+            return (
+              <option key={d.id} value={d.id}>
+                {d.name} {activeShift ? `— εργάζεται τώρα: ${activeShift.car}` : '(εκτός βάρδιας)'}
+              </option>
+            );
+          })}
         </select>
 
         <label style={label}>Όχημα (προαιρετικό)</label>
         <select value={car} onChange={e => { setCar(e.target.value); setError(''); }} style={input}>
           <option value="">— Χωρίς όχημα —</option>
-          {state.cars.map(c => <option key={c.id} value={c.id}>{c.id}{c.outOfService ? ' (εκτός λειτουργίας)' : ''}</option>)}
+          {state.cars.map(c => {
+            const occ = state.shifts.find(s => s.car === c.id && s.status === 'active');
+            const occDriver = occ && state.drivers.find(d => d.id === occ.driverId);
+            return (
+              <option key={c.id} value={c.id}>
+                {c.id}{c.outOfService ? ' (εκτός λειτουργίας)' : occ ? ` (τώρα: ${occDriver?.name || '—'})` : ''}
+              </option>
+            );
+          })}
         </select>
 
         <label style={label}>Σημειώσεις (προαιρετικό)</label>
