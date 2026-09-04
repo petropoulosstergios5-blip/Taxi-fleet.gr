@@ -14,6 +14,23 @@ const POLL_MS = 8000; // how often other devices' changes get picked up
 
 const KEY = 'taxifleet:state:v3'; // fallback localStorage key, used only if cloud is unreachable
 
+// Older saved data (from before a feature existed) may be missing whole top-level fields —
+// e.g. accounts saved before "Πρόγραμμα" existed have no `schedule` array at all, which then
+// crashes anything doing `state.schedule.find(...)`. Every place that loads state from
+// Supabase, localStorage, or the poll runs through this first, so a missing field always
+// comes back as its correct empty default instead of `undefined`.
+function hydrateState(raw) {
+  if (!raw || typeof raw !== 'object') return initialState;
+  return {
+    drivers: raw.drivers || initialState.drivers,
+    cars: raw.cars || initialState.cars,
+    shifts: raw.shifts || initialState.shifts,
+    bookings: raw.bookings || initialState.bookings,
+    appointments: raw.appointments || initialState.appointments,
+    schedule: raw.schedule || initialState.schedule,
+  };
+}
+
 async function uploadFuelReceipt(file) {
   const ext = (file.name.split('.').pop() || 'jpg').toLowerCase();
   const path = `${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
@@ -209,13 +226,14 @@ export default function TaxiFleetApp() {
         const { data, error } = await supabase.from('app_state').select('data').eq('id', ROW_ID).single();
         if (error) throw error;
         if (mounted && data?.data) {
-          setState(data.data);
-          try { localStorage.setItem(KEY, JSON.stringify(data.data)); } catch (e) {}
+          const hydrated = hydrateState(data.data);
+          setState(hydrated);
+          try { localStorage.setItem(KEY, JSON.stringify(hydrated)); } catch (e) {}
           setCloudStatus('online');
         } else if (mounted) {
           // No row yet — seed it with initialState (or local data if present).
           let seed = initialState;
-          try { const raw = localStorage.getItem(KEY); if (raw) seed = JSON.parse(raw); } catch (e) {}
+          try { const raw = localStorage.getItem(KEY); if (raw) seed = hydrateState(JSON.parse(raw)); } catch (e) {}
           await supabase.from('app_state').upsert({ id: ROW_ID, data: seed });
           setState(seed);
           setCloudStatus('online');
@@ -224,7 +242,7 @@ export default function TaxiFleetApp() {
         console.error('Supabase load failed, using local data:', e);
         try {
           const raw = localStorage.getItem(KEY);
-          if (mounted && raw) setState(JSON.parse(raw));
+          if (mounted && raw) setState(hydrateState(JSON.parse(raw)));
         } catch (e2) { /* first run, nothing saved anywhere */ }
         if (mounted) setCloudStatus('offline');
       } finally {
@@ -245,10 +263,11 @@ export default function TaxiFleetApp() {
         if (error) throw error;
         if (data?.data) {
           setState(prev => {
-            const nextStr = JSON.stringify(data.data);
+            const hydrated = hydrateState(data.data);
+            const nextStr = JSON.stringify(hydrated);
             if (nextStr === JSON.stringify(prev)) return prev;
             try { localStorage.setItem(KEY, nextStr); } catch (e) {}
-            return data.data;
+            return hydrated;
           });
         }
         setCloudStatus('online');
