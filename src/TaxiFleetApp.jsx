@@ -14,6 +14,15 @@ const POLL_MS = 8000; // how often other devices' changes get picked up
 
 const KEY = 'taxifleet:state:v3'; // fallback localStorage key, used only if cloud is unreachable
 
+async function uploadFuelReceipt(file) {
+  const ext = (file.name.split('.').pop() || 'jpg').toLowerCase();
+  const path = `${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+  const { error } = await supabase.storage.from('fuel-receipts').upload(path, file, { cacheControl: '3600', upsert: false });
+  if (error) throw error;
+  const { data } = supabase.storage.from('fuel-receipts').getPublicUrl(path);
+  return data.publicUrl;
+}
+
 const seedDrivers = [
   { id: 'd1', username: 'giorgos', password: '1111', name: 'Γιώργος Παπαδόπουλος', car: 'TAXI 1' },
   { id: 'd2', username: 'nikos', password: '1111', name: 'Νίκος Σταύρου', car: 'TAXI 2' },
@@ -111,10 +120,24 @@ const STATUS_META = {
   cancelled: { label: 'Ακυρώθηκε', color: '#8B92A0' },
 };
 
+const SESSION_KEY = 'taxifleet:session:v1';
+
 export default function TaxiFleetApp() {
   const [state, setState] = useState(initialState);
   const [loaded, setLoaded] = useState(false);
-  const [session, setSession] = useState(null); // {role:'driver', driverId} | {role:'admin'}
+  const [session, setSessionRaw] = useState(() => {
+    try {
+      const raw = localStorage.getItem(SESSION_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) { return null; }
+  }); // {role:'driver', driverId} | {role:'admin'}
+  const setSession = (next) => {
+    setSessionRaw(next);
+    try {
+      if (next) localStorage.setItem(SESSION_KEY, JSON.stringify(next));
+      else localStorage.removeItem(SESSION_KEY);
+    } catch (e) { /* ignore storage errors */ }
+  };
   const [cloudStatus, setCloudStatus] = useState('connecting'); // connecting | online | offline
   const lastWriteRef = useRef(0); // timestamp of our own last write, to avoid a poll overwriting it
 
@@ -199,6 +222,11 @@ export default function TaxiFleetApp() {
   }
 
   if (session.role === 'driver') {
+    const driverExists = state.drivers.some(d => d.id === session.driverId);
+    if (!driverExists) {
+      setSession(null);
+      return <LoginScreen drivers={state.drivers} onLogin={setSession} />;
+    }
     return <DriverApp state={state} persist={persist} driverId={session.driverId} onLogout={() => setSession(null)} cloudStatus={cloudStatus} />;
   }
 
@@ -658,7 +686,9 @@ function EndShiftScreen({ driver, shift, onBack, onSubmit }) {
   const [app, setApp] = useState('');
   const [expenses, setExpenses] = useState('');
   const [fuel, setFuel] = useState('');
-  const [fuelReceiptPhoto, setFuelReceiptPhoto] = useState(null);
+  const [photoPreview, setPhotoPreview] = useState(null); // local-only thumbnail, never saved
+  const [photoUrl, setPhotoUrl] = useState(null); // the actual uploaded Storage URL — this is what gets saved
+  const [photoStatus, setPhotoStatus] = useState('idle'); // idle | uploading | done | error
   const [gps, setGps] = useState(null);
   const [gpsStatus, setGpsStatus] = useState('idle');
   const fileRef = useRef(null);
@@ -670,18 +700,28 @@ function EndShiftScreen({ driver, shift, onBack, onSubmit }) {
     setGpsStatus(p ? 'ok' : 'error');
   };
 
-  const handlePhoto = (e) => {
+  const handlePhoto = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = () => setFuelReceiptPhoto(reader.result);
+    reader.onload = () => setPhotoPreview(reader.result);
     reader.readAsDataURL(file);
+
+    setPhotoStatus('uploading');
+    try {
+      const url = await uploadFuelReceipt(file);
+      setPhotoUrl(url);
+      setPhotoStatus('done');
+    } catch (err) {
+      console.error('Photo upload failed:', err);
+      setPhotoStatus('error');
+    }
   };
 
   const kmValid = endKm && Number(endKm) >= shift.startKm;
   const totalRevenue = (Number(cash) || 0) + (Number(card) || 0) + (Number(app) || 0);
   const netResult = totalRevenue - (Number(expenses) || 0) - (Number(fuel) || 0);
-  const canSubmit = kmValid && cash !== '' && card !== '' && app !== '';
+  const canSubmit = kmValid && cash !== '' && card !== '' && app !== '' && photoStatus !== 'uploading';
 
   return (
     <Screen title="Κλείσιμο Βάρδιας" subtitle={`${shift.car} · ξεκίνησε στα ${shift.startKm} χλμ`} onBack={onBack}>
@@ -714,11 +754,15 @@ function EndShiftScreen({ driver, shift, onBack, onSubmit }) {
 
       <label style={label}>Φωτογραφία απόδειξης πετρελαίου</label>
       <input type="file" accept="image/*" capture="environment" ref={fileRef} onChange={handlePhoto} style={{ display: 'none' }} />
-      <button onClick={() => fileRef.current?.click()} style={{ width: '100%', background: CARD, border: `1px dashed ${BORDER}`, borderRadius: 10, padding: 14, color: MUTE, fontSize: 14, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginBottom: 16 }}>
-        <Camera size={16} /> {fuelReceiptPhoto ? 'Αλλαγή φωτογραφίας' : 'Λήψη φωτογραφίας'}
+      <button onClick={() => fileRef.current?.click()} disabled={photoStatus === 'uploading'} style={{ width: '100%', background: CARD, border: `1px dashed ${BORDER}`, borderRadius: 10, padding: 14, color: MUTE, fontSize: 14, cursor: photoStatus === 'uploading' ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginBottom: 8 }}>
+        <Camera size={16} />
+        {photoStatus === 'uploading' ? 'Μεταφόρτωση...' : photoPreview ? 'Αλλαγή φωτογραφίας' : 'Λήψη φωτογραφίας'}
       </button>
-      {fuelReceiptPhoto && (
-        <img src={fuelReceiptPhoto} alt="Απόδειξη" style={{ width: '100%', borderRadius: 10, marginBottom: 16, border: `1px solid ${BORDER}` }} />
+      {photoStatus === 'error' && (
+        <div style={{ color: RED, fontSize: 12, marginBottom: 12 }}>Η μεταφόρτωση απέτυχε — δοκίμασε ξανά πριν κλείσεις τη βάρδια.</div>
+      )}
+      {photoPreview && (
+        <img src={photoPreview} alt="Απόδειξη" style={{ width: '100%', borderRadius: 10, marginBottom: 16, border: `1px solid ${BORDER}` }} />
       )}
 
       <div style={{ background: CARD, borderRadius: 12, padding: 16, marginBottom: 20, border: `1px solid ${BORDER}` }}>
@@ -733,7 +777,7 @@ function EndShiftScreen({ driver, shift, onBack, onSubmit }) {
       </div>
 
       <button
-        onClick={() => canSubmit && onSubmit({ endKm, cash, card, app, expenses, fuel, fuelReceiptPhoto, gps })}
+        onClick={() => canSubmit && onSubmit({ endKm, cash, card, app, expenses, fuel, fuelReceiptPhoto: photoUrl, gps })}
         disabled={!canSubmit}
         style={{ ...btnPrimary, background: canSubmit ? RED : '#3A4150', color: '#fff', justifyContent: 'center', cursor: canSubmit ? 'pointer' : 'not-allowed' }}
       >
@@ -1449,7 +1493,11 @@ function TodayTab({ state, onLock, onUnlock }) {
                 <MiniStat label="Τζίρος" value={fmtEUR(revenue)} color={GREEN} />
                 <MiniStat label="Χλμ" value={km != null ? km : '—'} />
                 <MiniStat label="Καύσιμο" value={fmtEUR(s.fuel)} />
-                {s.fuelReceiptPhoto && <MiniStat label="Απόδειξη" value="📷 επισυνάφθηκε" />}
+                {s.fuelReceiptPhoto && (
+                  <a href={s.fuelReceiptPhoto} target="_blank" rel="noreferrer" style={{ textDecoration: 'none' }}>
+                    <MiniStat label="Απόδειξη" value="📷 δείτε φωτο" color={ACCENT} />
+                  </a>
+                )}
                 {s.gpsStart && s.gpsEnd && <MiniStat label="GPS" value="✓ καταγράφηκε" color={GREEN} />}
               </div>
               {s.status === 'closed' && (
