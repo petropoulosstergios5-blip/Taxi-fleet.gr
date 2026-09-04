@@ -23,31 +23,6 @@ async function uploadFuelReceipt(file) {
   return data.publicUrl;
 }
 
-// Highest odometer reading ever logged for a car, from driver shift records.
-function getCarCurrentKm(state, carId) {
-  let max = 0;
-  state.shifts.forEach(s => {
-    if (s.car !== carId) return;
-    if (s.endKm != null && s.endKm > max) max = s.endKm;
-    if (s.startKm != null && s.startKm > max) max = s.startKm;
-  });
-  return max;
-}
-
-// Service due status for a car, given its current odometer reading.
-function getServiceStatus(car, currentKm) {
-  if (!car.serviceIntervalKm) return null;
-  const base = car.lastServiceKm || 0;
-  const nextDue = base + Number(car.serviceIntervalKm);
-  const remaining = nextDue - currentKm;
-  return {
-    nextDue,
-    remaining,
-    due: remaining <= 0,
-    dueSoon: remaining > 0 && remaining <= 1000,
-  };
-}
-
 const seedDrivers = [
   { id: 'd1', username: 'giorgos', password: '1111', name: 'Γιώργος Παπαδόπουλος', car: 'TAXI 1' },
   { id: 'd2', username: 'nikos', password: '1111', name: 'Νίκος Σταύρου', car: 'TAXI 2' },
