@@ -59,7 +59,7 @@ const initialState = {
   appointments: [], // admin-scheduled dispatch jobs: {id, date, time, durationMin, pickup, dropoff, customerName, driverId, car, status, notes,
                      //   createdAt, assignedAt, acceptedAt, arrivedAt, completedAt}
   schedule: [], // weekly roster entries: {id, weekStart (Monday, ISO), driverId, day (0=Mon..6=Sun), slot: 'morning'|'night'|'rest', car}
-  reportsResetAt: null, // ISO date — "Γενικό σύνολο" in Reports only counts shifts from this date on. Doesn't delete anything; monthly view always sees full history.
+  reportsResetAt: null, // ISO timestamp (date+time) — "Γενικό σύνολο" in Reports only counts shifts closed after this moment. Doesn't delete anything; monthly view always sees full history.
 };
 
 const fontStack = { fontFamily: 'Inter, system-ui, sans-serif' };
@@ -2454,7 +2454,7 @@ function ReportsTab({ state, persist }) {
 
   const resetStats = async () => {
     if (!confirm('Μηδενισμός γενικού συνόλου; Τα δεδομένα δεν διαγράφονται — παραμένουν πλήρη στη μηνιαία προβολή και στις Βάρδιες. Απλά το "Γενικό σύνολο" θα ξαναμετράει από σήμερα.')) return;
-    await persist({ ...state, reportsResetAt: isoDateStr(new Date()) });
+    await persist({ ...state, reportsResetAt: new Date().toISOString() });
   };
   const clearReset = async () => {
     if (!confirm('Εμφάνιση όλου του ιστορικού ξανά στο γενικό σύνολο;')) return;
@@ -2462,7 +2462,7 @@ function ReportsTab({ state, persist }) {
   };
 
   const totalShifts = state.reportsResetAt
-    ? closedOrLocked.filter(s => s.date >= state.reportsResetAt)
+    ? closedOrLocked.filter(s => s.endTime && s.endTime >= state.reportsResetAt)
     : closedOrLocked;
   const monthShifts = closedOrLocked.filter(s => s.date.slice(0, 7) === month);
 
@@ -2491,7 +2491,9 @@ function ReportsTab({ state, persist }) {
       {view === 'total' ? (
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8, marginBottom: 16 }}>
           <div style={{ color: MUTE, fontSize: 12 }}>
-            {state.reportsResetAt ? `Μετράει από ${dmy(state.reportsResetAt)} — το παλιότερο ιστορικό παραμένει διαθέσιμο στη μηνιαία προβολή` : 'Μετράει όλο το ιστορικό'}
+            {state.reportsResetAt
+              ? `Μετράει από ${dmy(state.reportsResetAt.slice(0, 10))} ${new Date(state.reportsResetAt).toLocaleTimeString('el-GR', { hour: '2-digit', minute: '2-digit', hour12: false })} — το παλιότερο ιστορικό παραμένει διαθέσιμο στη μηνιαία προβολή`
+              : 'Μετράει όλο το ιστορικό'}
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
             {state.reportsResetAt && <button onClick={clearReset} style={smallBtn(MUTE)}>Εμφάνιση όλων</button>}
