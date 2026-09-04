@@ -108,14 +108,10 @@ function checkAppointmentConflict({ appointments, shifts, cars }, { date, time, 
     if (carConflict) {
       return { ok: false, reason: `Το ${car} είναι δεσμευμένο από άλλο ραντεβού (${carConflict.time}).` };
     }
-    const carRecord = cars.find(c => c.id === car);
-    if (carRecord?.outOfService) {
-      return { ok: false, reason: `Το ${car} έχει δηλωθεί εκτός λειτουργίας.` };
-    }
+    // Note: no block for out-of-service cars or off-duty drivers here — appointments are
+    // often scheduled in advance, before the driver's shift or the car's return to service.
   }
 
-  // 3. Driver must have a shift that day to be assignable (soft check — only warn, not block,
-  //    since shifts may be logged same-day and admin may pre-schedule ahead of time)
   return { ok: true };
 }
 
@@ -126,8 +122,8 @@ function minToTime(mins) {
 }
 
 const STATUS_META = {
-  pending: { label: 'Αναμονή', color: '#F5B942' },
-  assigned: { label: 'Ανατέθηκε', color: '#5B8DEF' },
+  pending: { label: 'Αναμονή ανάθεσης', color: '#F5B942' },
+  assigned: { label: 'Εκκρεμεί αποδοχή', color: '#F5B942' },
   accepted: { label: 'Αποδεκτό', color: '#5B8DEF' },
   enroute: { label: 'Σε διαδρομή', color: '#5B8DEF' },
   completed: { label: 'Ολοκληρώθηκε', color: '#4A9B6E' },
@@ -1427,6 +1423,18 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
         <button onClick={submit} disabled={!canSubmit} style={{ ...btnPrimary, justifyContent: 'center', opacity: canSubmit ? 1 : 0.5, cursor: canSubmit ? 'pointer' : 'not-allowed' }}>
           {isEdit ? 'Αποθήκευση αλλαγών' : 'Δημιουργία ραντεβού'}
         </button>
+        {isEdit && (
+          <button
+            onClick={async () => {
+              if (!confirm('Διαγραφή αυτού του ραντεβού; Η ενέργεια δεν αναιρείται.')) return;
+              await persist({ ...state, appointments: state.appointments.filter(a => a.id !== appointment.id) });
+              onClose();
+            }}
+            style={{ width: '100%', background: 'none', border: `1px solid ${RED}`, color: RED, borderRadius: 12, padding: 12, fontSize: 14, fontWeight: 700, cursor: 'pointer', marginTop: 10 }}
+          >
+            Διαγραφή ραντεβού
+          </button>
+        )}
       </div>
     </div>
   );
@@ -1437,6 +1445,7 @@ function CalendarTab({ state, persist }) {
   const [date, setDate] = useState(isoDateStr(new Date()));
   const [showNew, setShowNew] = useState(false);
   const [prefillTime, setPrefillTime] = useState('10:00');
+  const [editingAppt, setEditingAppt] = useState(null);
 
   const hours = Array.from({ length: 15 }, (_, i) => 7 + i); // 07:00 - 21:00
   const cars = state.cars.map(c => c.id);
@@ -1452,11 +1461,13 @@ function CalendarTab({ state, persist }) {
   };
 
   const cellColor = (appts, carRecord) => {
+    if (appts.length > 0) {
+      const a = appts[0];
+      const meta = STATUS_META[a.status] || STATUS_META.pending;
+      return { bg: `${meta.color}22`, label: `✈ ${a.dropoff}`, text: meta.color };
+    }
     if (carRecord?.outOfService) return { bg: '#3a2a2a', label: 'Εκτός λειτουργίας', text: '#c88' };
-    if (appts.length === 0) return { bg: 'rgba(74,155,110,0.12)', label: 'Διαθέσιμο', text: GREEN };
-    const a = appts[0];
-    const meta = STATUS_META[a.status] || STATUS_META.pending;
-    return { bg: `${meta.color}22`, label: `✈ ${a.dropoff}`, text: meta.color };
+    return { bg: 'rgba(74,155,110,0.12)', label: 'Διαθέσιμο', text: GREEN };
   };
 
   return (
@@ -1505,7 +1516,14 @@ function CalendarTab({ state, persist }) {
                 return (
                   <div
                     key={c + h}
-                    onClick={() => { setPrefillTime(`${String(h).padStart(2, '0')}:00`); setShowNew(true); }}
+                    onClick={() => {
+                      if (appts[0]) {
+                        setEditingAppt(appts[0]);
+                      } else {
+                        setPrefillTime(`${String(h).padStart(2, '0')}:00`);
+                        setShowNew(true);
+                      }
+                    }}
                     style={{
                       borderTop: `1px solid ${CARD}`, background: style.bg, minHeight: 44, padding: '6px 8px',
                       cursor: 'pointer', display: 'flex', alignItems: 'center',
@@ -1523,6 +1541,9 @@ function CalendarTab({ state, persist }) {
 
       {showNew && (
         <NewAppointmentModal state={state} persist={persist} onClose={() => setShowNew(false)} defaultDate={date} defaultTime={prefillTime} />
+      )}
+      {editingAppt && (
+        <NewAppointmentModal state={state} persist={persist} appointment={editingAppt} onClose={() => setEditingAppt(null)} />
       )}
     </div>
   );
