@@ -76,9 +76,19 @@ function todayStr() {
   return d.toLocaleDateString('el-GR');
 }
 function isoDateStr(d) {
-  // yyyy-mm-dd for stable sorting/filtering, independent of locale
+  // yyyy-mm-dd, built from LOCAL date parts. toISOString() (used before) converts to UTC
+  // first, which silently shifts the date back a day for any timezone ahead of UTC
+  // (Greece included) — this was the root cause of the wrong day/date pairing in the schedule.
   const dt = new Date(d);
-  return dt.toISOString().slice(0, 10);
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, '0');
+  const day = String(dt.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+function dmy(isoStr) {
+  // yyyy-mm-dd -> dd/mm, for display only (storage/sorting stays yyyy-mm-dd)
+  const [, m, d] = isoStr.split('-');
+  return `${d}/${m}`;
 }
 function mondayOf(dateStr) {
   const d = new Date(dateStr + 'T00:00:00');
@@ -914,7 +924,7 @@ function MyScheduleScreen({ state, driverId, onBack }) {
   const days = [0, 1, 2, 3, 4, 5, 6];
 
   return (
-    <Screen title="Πρόγραμμά μου" subtitle={`${weekStart} — ${addDaysIso(weekStart, 6)}`} onBack={onBack}>
+    <Screen title="Πρόγραμμά μου" subtitle={`${dmy(weekStart)} — ${dmy(addDaysIso(weekStart, 6))}`} onBack={onBack}>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16 }}>
         <button onClick={() => setWeekStart(addDaysIso(weekStart, -7))} style={smallBtn(MUTE)}>‹ Προηγ. εβδομάδα</button>
         <button onClick={() => setWeekStart(addDaysIso(weekStart, 7))} style={smallBtn(MUTE)}>Επόμ. εβδομάδα ›</button>
@@ -929,7 +939,7 @@ function MyScheduleScreen({ state, driverId, onBack }) {
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <div>
                   <div style={{ color: TEXT, fontSize: 14, fontWeight: 700 }}>{DAY_LABELS_FULL[day]}</div>
-                  <div style={{ color: MUTE, fontSize: 12 }}>{dateStr}</div>
+                  <div style={{ color: MUTE, fontSize: 12 }}>{dmy(dateStr)}</div>
                 </div>
                 {!entry ? (
                   <span style={{ color: MUTE, fontSize: 13 }}>—</span>
@@ -1305,7 +1315,7 @@ function ScheduleTab({ state, persist }) {
         <div style={{ color: TEXT, fontSize: 15, fontWeight: 700 }}>Πρόγραμμα οδηγών</div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <button onClick={() => setWeekStart(addDaysIso(weekStart, -7))} style={smallBtn(MUTE)}>‹ Προηγ.</button>
-          <span style={{ color: MUTE, fontSize: 13 }}>{weekStart} — {weekEndLabel}</span>
+          <span style={{ color: MUTE, fontSize: 13 }}>{dmy(weekStart)} — {dmy(weekEndLabel)}</span>
           <button onClick={() => setWeekStart(addDaysIso(weekStart, 7))} style={smallBtn(MUTE)}>Επόμ. ›</button>
           <button onClick={() => setWeekStart(mondayOf(isoDateStr(new Date())))} style={smallBtn(ACCENT)}>Σήμερα</button>
         </div>
@@ -1319,7 +1329,7 @@ function ScheduleTab({ state, persist }) {
               {[0, 1, 2, 3, 4, 5, 6].map(day => (
                 <th key={day} style={{ ...td, color: MUTE, fontWeight: 500, minWidth: 130 }}>
                   {DAY_LABELS_SHORT[day]}<br />
-                  <span style={{ fontSize: 11 }}>{addDaysIso(weekStart, day).slice(5)}</span>
+                  <span style={{ fontSize: 11 }}>{dmy(addDaysIso(weekStart, day))}</span>
                 </th>
               ))}
             </tr>
@@ -1977,7 +1987,7 @@ function AppointmentsHistoryTab({ state, persist }) {
             <div key={a.id} style={{ background: CARD, borderRadius: 12, padding: 14, border: `1px solid ${BORDER}` }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                 <div>
-                  <div style={{ color: TEXT, fontSize: 14, fontWeight: 700 }}>{a.date} · {a.time}</div>
+                  <div style={{ color: TEXT, fontSize: 14, fontWeight: 700 }}>{dmy(a.date)} · {a.time}</div>
                   <div style={{ color: MUTE, fontSize: 13, marginTop: 2 }}>{a.pickup} → {a.dropoff}</div>
                   <div style={{ color: MUTE, fontSize: 12, marginTop: 4 }}>{a.customerName}</div>
                 </div>
