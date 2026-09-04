@@ -28,6 +28,7 @@ function hydrateState(raw) {
     bookings: raw.bookings || initialState.bookings,
     appointments: raw.appointments || initialState.appointments,
     schedule: raw.schedule || initialState.schedule,
+    reportsResetAt: raw.reportsResetAt !== undefined ? raw.reportsResetAt : initialState.reportsResetAt,
   };
 }
 
@@ -58,6 +59,7 @@ const initialState = {
   appointments: [], // admin-scheduled dispatch jobs: {id, date, time, durationMin, pickup, dropoff, customerName, driverId, car, status, notes,
                      //   createdAt, assignedAt, acceptedAt, arrivedAt, completedAt}
   schedule: [], // weekly roster entries: {id, weekStart (Monday, ISO), driverId, day (0=Mon..6=Sun), slot: 'morning'|'night'|'rest', car}
+  reportsResetAt: null, // ISO date — "Γενικό σύνολο" in Reports only counts shifts from this date on. Doesn't delete anything; monthly view always sees full history.
 };
 
 const fontStack = { fontFamily: 'Inter, system-ui, sans-serif' };
@@ -1097,7 +1099,7 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
         {tab === 'shifts' && <AllShiftsTab state={state} persist={persist} onLock={lockShift} onUnlock={unlockShift} />}
         {tab === 'schedule' && <ScheduleTab state={state} persist={persist} />}
         {tab === 'bookings' && <BookingsTab state={state} persist={persist} />}
-        {tab === 'reports' && <ReportsTab state={state} />}
+        {tab === 'reports' && <ReportsTab state={state} persist={persist} />}
         {tab === 'fleet' && <FleetTab state={state} persist={persist} />}
         {tab === 'maintenance' && <MaintenanceTab state={state} persist={persist} />}
       </div>
@@ -2427,13 +2429,11 @@ function EditBookingModal({ state, persist, booking, onClose }) {
   );
 }
 
-function ReportsTab({ state }) {
-  const closedOrLocked = state.shifts.filter(s => s.status !== 'active');
+function computeReportStats(state, shifts) {
   const byDriver = {};
   const byCar = {};
   let totalRevenue = 0, totalExpenses = 0, totalFuel = 0;
-
-  closedOrLocked.forEach(s => {
+  shifts.forEach(s => {
     const revenue = (s.cash || 0) + (s.card || 0) + (s.app || 0);
     totalRevenue += revenue;
     totalExpenses += s.expenses || 0;
@@ -2441,25 +2441,84 @@ function ReportsTab({ state }) {
     const driver = state.drivers.find(d => d.id === s.driverId);
     const dName = driver?.name || '—';
     byDriver[dName] = (byDriver[dName] || 0) + revenue;
-    byCar[s.car] = (byCar[s.car] || 0) + revenue;
+    byCar[carLabelById(state, s.car)] = (byCar[carLabelById(state, s.car)] || 0) + revenue;
   });
+  return { byDriver, byCar, totalRevenue, totalExpenses, totalFuel, netProfit: totalRevenue - totalExpenses - totalFuel };
+}
 
-  const netProfit = totalRevenue - totalExpenses - totalFuel;
+function ReportsTab({ state, persist }) {
+  const [view, setView] = useState('total'); // 'total' | 'month'
+  const [month, setMonth] = useState(isoDateStr(new Date()).slice(0, 7)); // "YYYY-MM"
+
+  const closedOrLocked = state.shifts.filter(s => s.status !== 'active');
+
+  const resetStats = async () => {
+    if (!confirm('Μηδενισμός γενικού συνόλου; Τα δεδομένα δεν διαγράφονται — παραμένουν πλήρη στη μηνιαία προβολή και στις Βάρδιες. Απλά το "Γενικό σύνολο" θα ξαναμετράει από σήμερα.')) return;
+    await persist({ ...state, reportsResetAt: isoDateStr(new Date()) });
+  };
+  const clearReset = async () => {
+    if (!confirm('Εμφάνιση όλου του ιστορικού ξανά στο γενικό σύνολο;')) return;
+    await persist({ ...state, reportsResetAt: null });
+  };
+
+  const totalShifts = state.reportsResetAt
+    ? closedOrLocked.filter(s => s.date >= state.reportsResetAt)
+    : closedOrLocked;
+  const monthShifts = closedOrLocked.filter(s => s.date.slice(0, 7) === month);
+
+  const stats = computeReportStats(state, view === 'total' ? totalShifts : monthShifts);
+
+  // Last 12 months for the dropdown
+  const monthOptions = Array.from({ length: 12 }, (_, i) => {
+    const d = new Date();
+    d.setDate(1);
+    d.setMonth(d.getMonth() - i);
+    return isoDateStr(d).slice(0, 7);
+  });
+  const monthLabel = (ym) => {
+    const [y, m] = ym.split('-');
+    const names = ['Ιαν', 'Φεβ', 'Μαρ', 'Απρ', 'Μάι', 'Ιουν', 'Ιουλ', 'Αυγ', 'Σεπ', 'Οκτ', 'Νοε', 'Δεκ'];
+    return `${names[Number(m) - 1]} ${y}`;
+  };
 
   return (
     <div>
+      <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+        <button onClick={() => setView('total')} style={{ padding: '8px 14px', borderRadius: 8, border: `1px solid ${view === 'total' ? ACCENT : BORDER}`, background: view === 'total' ? 'rgba(245,185,66,0.12)' : 'none', color: view === 'total' ? ACCENT : MUTE, fontWeight: 700, fontSize: 13, cursor: 'pointer' }}>Γενικό σύνολο</button>
+        <button onClick={() => setView('month')} style={{ padding: '8px 14px', borderRadius: 8, border: `1px solid ${view === 'month' ? ACCENT : BORDER}`, background: view === 'month' ? 'rgba(245,185,66,0.12)' : 'none', color: view === 'month' ? ACCENT : MUTE, fontWeight: 700, fontSize: 13, cursor: 'pointer' }}>Ανά μήνα</button>
+      </div>
+
+      {view === 'total' ? (
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8, marginBottom: 16 }}>
+          <div style={{ color: MUTE, fontSize: 12 }}>
+            {state.reportsResetAt ? `Μετράει από ${dmy(state.reportsResetAt)} — το παλιότερο ιστορικό παραμένει διαθέσιμο στη μηνιαία προβολή` : 'Μετράει όλο το ιστορικό'}
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            {state.reportsResetAt && <button onClick={clearReset} style={smallBtn(MUTE)}>Εμφάνιση όλων</button>}
+            <button onClick={resetStats} style={smallBtn(RED)}>Μηδενισμός στατιστικών</button>
+          </div>
+        </div>
+      ) : (
+        <div style={{ marginBottom: 16 }}>
+          <select value={month} onChange={e => setMonth(e.target.value)} style={{ ...input, marginBottom: 0, width: 200 }}>
+            {monthOptions.map(ym => <option key={ym} value={ym}>{monthLabel(ym)}</option>)}
+          </select>
+          <div style={{ color: MUTE, fontSize: 12, marginTop: 6 }}>Πλήρες ιστορικό — δεν επηρεάζεται από μηδενισμό. Διαθέσιμο για τους τελευταίους 12 μήνες.</div>
+        </div>
+      )}
+
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 24 }}>
-        <StatCard icon={Wallet} label="Συνολικός τζίρος" value={fmtEUR(totalRevenue)} accent={ACCENT} />
-        <StatCard icon={Fuel} label="Καύσιμα" value={fmtEUR(totalFuel)} accent={MUTE} />
-        <StatCard icon={AlertCircle} label="Έξοδα" value={fmtEUR(totalExpenses)} accent={RED} />
-        <StatCard icon={CheckCircle2} label="Καθαρό κέρδος" value={fmtEUR(netProfit)} accent={GREEN} />
+        <StatCard icon={Wallet} label="Συνολικός τζίρος" value={fmtEUR(stats.totalRevenue)} accent={ACCENT} />
+        <StatCard icon={Fuel} label="Καύσιμα" value={fmtEUR(stats.totalFuel)} accent={MUTE} />
+        <StatCard icon={AlertCircle} label="Έξοδα" value={fmtEUR(stats.totalExpenses)} accent={RED} />
+        <StatCard icon={CheckCircle2} label="Καθαρό κέρδος" value={fmtEUR(stats.netProfit)} accent={GREEN} />
       </div>
 
       <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, marginBottom: 10 }}>Τζίρος ανά οδηγό</div>
-      <BarList data={byDriver} />
+      <BarList data={stats.byDriver} />
 
       <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, margin: '24px 0 10px' }}>Τζίρος ανά όχημα</div>
-      <BarList data={byCar} />
+      <BarList data={stats.byCar} />
     </div>
   );
 }
