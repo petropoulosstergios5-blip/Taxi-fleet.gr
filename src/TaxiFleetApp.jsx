@@ -116,6 +116,16 @@ function rangesOverlap(a, b) { return a[0] < b[1] && b[0] < a[1]; }
 // Current odometer reading for a car = the highest of: the admin-set baseline (car.baseKm,
 // used e.g. when a car is first added to the fleet), or the highest km ever logged against
 // it across all shifts (closed shifts' endKm, or an active shift's startKm if higher).
+// Short title for a car — the license plate once the admin sets one (e.g. "ΤΑΕ4088"),
+// falling back to the internal id (e.g. "TAXI 1") until then.
+function carLabel(car) {
+  if (!car) return '—';
+  return car.plate || car.id;
+}
+function carLabelById(state, carId) {
+  return carLabel(state.cars.find(c => c.id === carId));
+}
+
 function getCarCurrentKm(state, carId) {
   const car = state.cars.find(c => c.id === carId);
   let max = car?.baseKm || 0;
@@ -523,8 +533,8 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
   };
 
   if (screen === 'startShift') return <StartShiftScreen state={state} driver={driver} cars={state.cars} activeShifts={state.shifts.filter(s => s.status === 'active')} onBack={() => setScreen('home')} onSubmit={startShift} />;
-  if (screen === 'booking') return <BookingScreen driver={driver} shift={activeShift} onBack={() => setScreen('home')} onSubmit={addBooking} />;
-  if (screen === 'endShift') return <EndShiftScreen driver={driver} shift={activeShift} onBack={() => setScreen('home')} onSubmit={closeShift} />;
+  if (screen === 'booking') return <BookingScreen state={state} driver={driver} shift={activeShift} onBack={() => setScreen('home')} onSubmit={addBooking} />;
+  if (screen === 'endShift') return <EndShiftScreen state={state} driver={driver} shift={activeShift} onBack={() => setScreen('home')} onSubmit={closeShift} />;
   if (screen === 'history') return <HistoryScreen state={state} driverId={driverId} onBack={() => setScreen('home')} />;
   if (screen === 'schedule') return <MyScheduleScreen state={state} driverId={driverId} onBack={() => setScreen('home')} />;
 
@@ -532,7 +542,7 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
     <div style={{ minHeight: '100vh', background: BG, ...fontStack }}>
       <div style={{ padding: '20px 20px 0', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <div>
-          <div style={{ color: MUTE, fontSize: 13 }}>{activeShift?.car || driver.car}</div>
+          <div style={{ color: MUTE, fontSize: 13 }}>{carLabelById(state, activeShift?.car || driver.car)}</div>
           <div style={{ color: TEXT, fontSize: 19, fontWeight: 700 }}>{driver.name}</div>
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
@@ -590,7 +600,7 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
           <div style={{ background: CARD, border: `1px solid ${GREEN}`, borderRadius: 16, padding: 20, marginBottom: 20 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
               <div style={{ width: 8, height: 8, borderRadius: '50%', background: GREEN }} />
-              <span style={{ color: GREEN, fontSize: 13, fontWeight: 600 }}>Βάρδια σε εξέλιξη — {activeShift.car}</span>
+              <span style={{ color: GREEN, fontSize: 13, fontWeight: 600 }}>Βάρδια σε εξέλιξη — {carLabelById(state, activeShift.car)}</span>
             </div>
             <div style={{ color: TEXT, fontSize: 14 }}>Έναρξη {new Date(activeShift.startTime).toLocaleTimeString('el-GR', { hour: '2-digit', minute: '2-digit', hour12: false })} · {activeShift.startKm} χλμ</div>
             <div style={{ color: MUTE, fontSize: 13, marginBottom: 16 }}>Αρχικό ταμείο: {fmtEUR(activeShift.startCash)}</div>
@@ -689,7 +699,7 @@ function StartShiftScreen({ state, driver, cars, activeShifts, onBack, onSubmit 
   const canSubmit = selectedCar && startCash !== '';
 
   return (
-    <Screen title="Έναρξη Βάρδιας" subtitle={selectedCar || 'Επιλογή οχήματος'} onBack={onBack}>
+    <Screen title="Έναρξη Βάρδιας" subtitle={selectedCar ? carLabelById(state, selectedCar) : 'Επιλογή οχήματος'} onBack={onBack}>
       {availableCars.length === 0 ? (
         <div style={{ background: 'rgba(193,84,60,0.12)', border: `1px solid ${RED}`, borderRadius: 10, padding: 14, color: RED, fontSize: 13, marginBottom: 16 }}>
           Δεν υπάρχει διαθέσιμο όχημα αυτή τη στιγμή — όλα είναι είτε σε βάρδια είτε εκτός λειτουργίας.
@@ -698,7 +708,7 @@ function StartShiftScreen({ state, driver, cars, activeShifts, onBack, onSubmit 
         <>
           <label style={label}>Όχημα</label>
           <select value={selectedCar} onChange={e => setSelectedCar(e.target.value)} style={input}>
-            {availableCars.map(c => <option key={c.id} value={c.id}>{c.id}</option>)}
+            {availableCars.map(c => <option key={c.id} value={c.id}>{carLabel(c)}</option>)}
           </select>
         </>
       )}
@@ -765,7 +775,7 @@ function GPSButton({ status, onClick, gps, label }) {
   );
 }
 
-function BookingScreen({ driver, shift, onBack, onSubmit }) {
+function BookingScreen({ state, driver, shift, onBack, onSubmit }) {
   const [flightNumber, setFlightNumber] = useState('');
   const [arrivalTime, setArrivalTime] = useState('');
   const [customerName, setCustomerName] = useState('');
@@ -777,7 +787,7 @@ function BookingScreen({ driver, shift, onBack, onSubmit }) {
   const canSubmit = customerName && destination && price;
 
   return (
-    <Screen title="Νέα Προμίσθωση" subtitle={shift?.car || driver.car} onBack={onBack}>
+    <Screen title="Νέα Προμίσθωση" subtitle={carLabelById(state, shift?.car || driver.car)} onBack={onBack}>
       <label style={label}>Αριθμός πτήσης (προαιρετικό)</label>
       <input value={flightNumber} onChange={e => setFlightNumber(e.target.value)} placeholder="π.χ. A3 654" style={input} />
 
@@ -810,7 +820,7 @@ function BookingScreen({ driver, shift, onBack, onSubmit }) {
   );
 }
 
-function EndShiftScreen({ driver, shift, onBack, onSubmit }) {
+function EndShiftScreen({ state, driver, shift, onBack, onSubmit }) {
   const [endKm, setEndKm] = useState('');
   const [cash, setCash] = useState('');
   const [card, setCard] = useState('');
@@ -855,7 +865,7 @@ function EndShiftScreen({ driver, shift, onBack, onSubmit }) {
   const canSubmit = kmValid && cash !== '' && card !== '' && app !== '' && photoStatus !== 'uploading';
 
   return (
-    <Screen title="Κλείσιμο Βάρδιας" subtitle={`${shift.car} · ξεκίνησε στα ${shift.startKm} χλμ`} onBack={onBack}>
+    <Screen title="Κλείσιμο Βάρδιας" subtitle={`${carLabelById(state, shift.car)} · ξεκίνησε στα ${shift.startKm} χλμ`} onBack={onBack}>
       <label style={label}>Τελικά χιλιόμετρα</label>
       <input type="number" value={endKm} onChange={e => setEndKm(e.target.value)} placeholder="π.χ. 154480" style={{ ...input, border: `1px solid ${endKm && !kmValid ? RED : BORDER}` }} />
       {endKm && !kmValid && <div style={{ color: RED, fontSize: 12, marginTop: -12, marginBottom: 16 }}>Πρέπει να είναι ≥ {shift.startKm}</div>}
@@ -948,7 +958,7 @@ function MyScheduleScreen({ state, driverId, onBack }) {
                 ) : (
                   <div style={{ textAlign: 'right' }}>
                     <div style={{ color: ACCENT, fontSize: 13, fontWeight: 700 }}>{classifyShift(entry.startTime)} · {entry.startTime}–{entry.endTime}</div>
-                    <div style={{ color: MUTE, fontSize: 12 }}>{entry.car}</div>
+                    <div style={{ color: MUTE, fontSize: 12 }}>{carLabelById(state, entry.car)}</div>
                   </div>
                 )}
               </div>
@@ -976,7 +986,7 @@ function HistoryScreen({ state, driverId, onBack }) {
                 <StatusBadge status={s.status} />
               </div>
               <div style={{ color: MUTE, fontSize: 12, marginBottom: 8 }}>
-                {s.car} · {bookingsCount} προμισθώσεις {s.endKm ? `· ${s.endKm - s.startKm} χλμ` : ''}
+                {carLabelById(state, s.car)} · {bookingsCount} προμισθώσεις {s.endKm ? `· ${s.endKm - s.startKm} χλμ` : ''}
               </div>
               {s.status !== 'active' && (
                 <div style={{ display: 'flex', justifyContent: 'space-between' }}>
@@ -1125,7 +1135,7 @@ function FleetMapTab({ state }) {
       const { lat, lng, at } = s.currentLocation;
       pts.push([lat, lng]);
       const ageMin = Math.max(0, Math.round((Date.now() - new Date(at).getTime()) / 60000));
-      const html = `<b>${s.car}</b><br/>${driver?.name || ''}<br/>ενημέρωση πριν ${ageMin} λεπτά`;
+      const html = `<b>${carLabelById(state, s.car)}</b><br/>${driver?.name || ''}<br/>ενημέρωση πριν ${ageMin} λεπτά`;
       if (markersRef.current[s.id]) {
         markersRef.current[s.id].setLatLng([lat, lng]).setPopupContent(html);
       } else {
@@ -1217,7 +1227,7 @@ function MaintenanceTab({ state, persist }) {
           return (
             <div key={c.id} style={{ background: CARD, borderRadius: 12, padding: 16, border: `1px solid ${status === 'due' ? RED : BORDER}` }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-                <div style={{ color: TEXT, fontSize: 15, fontWeight: 700 }}>{c.id}</div>
+                <div style={{ color: TEXT, fontSize: 15, fontWeight: 700 }}>{carLabel(c)}</div>
                 <span style={{ background: `${statusMeta.color}22`, color: statusMeta.color, padding: '3px 9px', borderRadius: 6, fontSize: 12, fontWeight: 700 }}>{statusMeta.label}</span>
               </div>
 
@@ -1359,7 +1369,7 @@ function ScheduleTab({ state, persist }) {
                           <>
                             <div style={{ fontWeight: 700 }}>{classifyShift(entry.startTime)}</div>
                             <div>{entry.startTime}–{entry.endTime}</div>
-                            <div style={{ color: MUTE }}>{entry.car}</div>
+                            <div style={{ color: MUTE }}>{carLabelById(state, entry.car)}</div>
                           </>
                         ) : (
                           <span>+ Προσθήκη</span>
@@ -1389,7 +1399,7 @@ function ScheduleTab({ state, persist }) {
           <tbody>
             {state.cars.map(c => (
               <tr key={c.id} style={{ borderTop: `1px solid ${CARD}` }}>
-                <td style={{ ...td, fontWeight: 600 }}>{c.id}</td>
+                <td style={{ ...td, fontWeight: 600 }}>{carLabel(c)}</td>
                 {[0, 1, 2, 3, 4, 5, 6].map(day => {
                   const gaps = computeCarGaps(state.schedule, weekStart, day, c.id);
                   const fullyEmpty = gaps.length === 1 && gaps[0] === '00:00–24:00';
@@ -1466,7 +1476,7 @@ function EditScheduleEntryModal({ state, persist, weekStart, driverId, day, entr
             </div>
             <label style={label}>Όχημα</label>
             <select value={car} onChange={e => setCar(e.target.value)} style={input}>
-              {state.cars.map(c => <option key={c.id} value={c.id}>{c.id}</option>)}
+              {state.cars.map(c => <option key={c.id} value={c.id}>{carLabel(c)}</option>)}
             </select>
           </>
         )}
@@ -1487,9 +1497,10 @@ function EditCarModal({ state, persist, car, onClose }) {
   const [brand, setBrand] = useState(car.brand || '');
   const [model, setModel] = useState(car.model || '');
   const [year, setYear] = useState(car.year || '');
+  const [plate, setPlate] = useState(car.plate || '');
 
   const save = async () => {
-    await persist({ ...state, cars: state.cars.map(c => c.id === car.id ? { ...c, brand, model, year } : c) });
+    await persist({ ...state, cars: state.cars.map(c => c.id === car.id ? { ...c, brand, model, year, plate } : c) });
     onClose();
   };
 
@@ -1497,18 +1508,26 @@ function EditCarModal({ state, persist, car, onClose }) {
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'flex-end', justifyContent: 'center', zIndex: 50 }}>
       <div style={{ background: BG, border: `1px solid ${BORDER}`, borderRadius: '20px 20px 0 0', padding: 24, width: '100%', maxWidth: 480, maxHeight: '90vh', overflowY: 'auto' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
-          <div style={{ color: TEXT, fontSize: 17, fontWeight: 700 }}>Στοιχεία {car.id}</div>
+          <div style={{ color: TEXT, fontSize: 17, fontWeight: 700 }}>Στοιχεία {carLabel(car)}</div>
           <button onClick={onClose} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer' }}><X size={20} /></button>
         </div>
 
         <label style={label}>Μάρκα</label>
-        <input value={brand} onChange={e => setBrand(e.target.value)} style={input} placeholder="π.χ. Toyota" />
+        <input value={brand} onChange={e => setBrand(e.target.value)} style={input} placeholder="π.χ. Mercedes-Benz" />
 
         <label style={label}>Μοντέλο</label>
-        <input value={model} onChange={e => setModel(e.target.value)} style={input} placeholder="π.χ. Corolla" />
+        <input value={model} onChange={e => setModel(e.target.value)} style={input} placeholder="π.χ. Vito" />
 
-        <label style={label}>Χρονολογία</label>
-        <input value={year} onChange={e => setYear(e.target.value)} style={input} placeholder="π.χ. 2020" />
+        <div style={{ display: 'flex', gap: 10 }}>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Χρονολογία</label>
+            <input value={year} onChange={e => setYear(e.target.value)} style={input} placeholder="π.χ. 2020" />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Αριθμός κυκλοφορίας</label>
+            <input value={plate} onChange={e => setPlate(e.target.value.toUpperCase())} style={input} placeholder="π.χ. ΤΑΕ4088" />
+          </div>
+        </div>
 
         <button onClick={save} style={{ ...btnPrimary, justifyContent: 'center' }}>Αποθήκευση</button>
       </div>
@@ -1575,7 +1594,7 @@ function FleetTab({ state, persist }) {
             <div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                 <Car size={16} color={c.outOfService ? MUTE : (occ ? GREEN : ACCENT)} />
-                <span style={{ color: TEXT, fontSize: 14, fontWeight: 600 }}>{c.id}</span>
+                <span style={{ color: TEXT, fontSize: 14, fontWeight: 600 }}>{carLabel(c)}</span>
                 {c.outOfService && <span style={{ background: 'rgba(193,84,60,0.15)', color: RED, padding: '2px 7px', borderRadius: 5, fontSize: 11, fontWeight: 600 }}>Εκτός λειτουργίας</span>}
                 {!c.outOfService && occ && (
                   <span style={{ background: 'rgba(74,155,110,0.15)', color: GREEN, padding: '2px 7px', borderRadius: 5, fontSize: 11, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4 }}>
@@ -1588,6 +1607,9 @@ function FleetTab({ state, persist }) {
                 <div style={{ color: MUTE, fontSize: 12, marginTop: 3, marginLeft: 26 }}>
                   {[c.brand, c.model, c.year].filter(Boolean).join(' · ')}
                 </div>
+              )}
+              {!c.plate && (
+                <div style={{ color: MUTE, fontSize: 12, marginTop: 3, marginLeft: 26 }}>Χωρίς αριθμό κυκλοφορίας ακόμα — πάτα Επεξεργασία</div>
               )}
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
@@ -1666,7 +1688,7 @@ function DriverEditModal({ driver, cars, existingUsernames, onClose, onSave }) {
         <input value={password} onChange={e => setPassword(e.target.value)} style={input} />
         <label style={label}>Όχημα</label>
         <select value={car} onChange={e => setCar(e.target.value)} style={input}>
-          {cars.map(c => <option key={c.id} value={c.id}>{c.id}</option>)}
+          {cars.map(c => <option key={c.id} value={c.id}>{carLabel(c)}</option>)}
         </select>
         {error && <div style={{ color: RED, fontSize: 13, marginBottom: 12 }}>{error}</div>}
         <button onClick={submit} style={{ ...btnPrimary, justifyContent: 'center' }}>Αποθήκευση</button>
@@ -1786,7 +1808,7 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
             const activeShift = state.shifts.find(s => s.driverId === d.id && s.status === 'active');
             return (
               <option key={d.id} value={d.id}>
-                {d.name} {activeShift ? `— εργάζεται τώρα: ${activeShift.car}` : '(εκτός βάρδιας)'}
+                {d.name} {activeShift ? `— εργάζεται τώρα: ${carLabelById(state, activeShift.car)}` : '(εκτός βάρδιας)'}
               </option>
             );
           })}
@@ -1892,7 +1914,7 @@ function CalendarTab({ state, persist }) {
             const occDriver = occ && state.drivers.find(d => d.id === occ.driverId);
             return (
               <div key={c} style={{ textAlign: 'center', padding: '8px 4px' }}>
-                <div style={{ color: TEXT, fontSize: 13, fontWeight: 700 }}>{c}</div>
+                <div style={{ color: TEXT, fontSize: 13, fontWeight: 700 }}>{carLabelById(state, c)}</div>
                 {occ && (
                   <div style={{ color: GREEN, fontSize: 10, fontWeight: 600, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 3, marginTop: 2 }}>
                     <span style={{ width: 5, height: 5, borderRadius: '50%', background: GREEN, display: 'inline-block' }} />
@@ -2013,7 +2035,7 @@ function AppointmentsHistoryTab({ state, persist }) {
         </select>
         <select value={filterCar} onChange={e => setFilterCar(e.target.value)} style={{ ...input, marginBottom: 0, width: 130 }}>
           <option value="">Όλα τα οχήματα</option>
-          {state.cars.map(c => <option key={c.id} value={c.id}>{c.id}</option>)}
+          {state.cars.map(c => <option key={c.id} value={c.id}>{carLabel(c)}</option>)}
         </select>
         <input value={filterCustomer} onChange={e => setFilterCustomer(e.target.value)} placeholder="Πελάτης…" style={{ ...input, marginBottom: 0, width: 150 }} />
         <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)} style={{ ...input, marginBottom: 0, width: 150 }}>
@@ -2089,7 +2111,7 @@ function TodayTab({ state, onLock, onUnlock }) {
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
                 <div>
                   <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, display: 'flex', alignItems: 'center', gap: 8 }}>
-                    🚕 {s.car}
+                    🚕 {carLabelById(state, s.car)}
                   </div>
                   <div style={{ color: MUTE, fontSize: 13 }}>Οδηγός: {driver?.name}</div>
                 </div>
@@ -2157,7 +2179,7 @@ function AllShiftsTab({ state, persist, onLock, onUnlock }) {
         </select>
         <select value={filterCar} onChange={e => setFilterCar(e.target.value)} style={{ ...input, marginBottom: 0, width: 130 }}>
           <option value="">Όλα τα οχήματα</option>
-          {state.cars.map(c => <option key={c.id} value={c.id}>{c.id}</option>)}
+          {state.cars.map(c => <option key={c.id} value={c.id}>{carLabel(c)}</option>)}
         </select>
         <input type="date" value={filterFrom} onChange={e => setFilterFrom(e.target.value)} style={{ ...input, marginBottom: 0, width: 150 }} placeholder="Από" />
         <input type="date" value={filterTo} onChange={e => setFilterTo(e.target.value)} style={{ ...input, marginBottom: 0, width: 150 }} placeholder="Έως" />
@@ -2178,7 +2200,7 @@ function AllShiftsTab({ state, persist, onLock, onUnlock }) {
               const net = revenue != null ? revenue - (s.expenses || 0) - (s.fuel || 0) : null;
               return (
                 <tr key={s.id} style={{ borderTop: `1px solid ${CARD}` }}>
-                  <td style={td}>{s.car}</td>
+                  <td style={td}>{carLabelById(state, s.car)}</td>
                   <td style={td}>{driver?.name}</td>
                   <td style={td}>{s.date}</td>
                   <td style={td}>{s.endKm ? s.endKm - s.startKm : '—'}</td>
@@ -2244,7 +2266,7 @@ function EditShiftModal({ state, persist, shift, onClose }) {
 
         <label style={label}>Όχημα</label>
         <select value={car} onChange={e => setCar(e.target.value)} style={input}>
-          {state.cars.map(c => <option key={c.id} value={c.id}>{c.id}</option>)}
+          {state.cars.map(c => <option key={c.id} value={c.id}>{carLabel(c)}</option>)}
         </select>
 
         <div style={{ display: 'flex', gap: 10 }}>
