@@ -49,9 +49,9 @@ const seedDrivers = [
 const initialState = {
   drivers: seedDrivers,
   cars: [
-    { id: 'TAXI 1', outOfService: false, baseKm: 0, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [] },
-    { id: 'TAXI 2', outOfService: false, baseKm: 0, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [] },
-    { id: 'TAXI 3', outOfService: false, baseKm: 0, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [] },
+    { id: 'TAXI 1', outOfService: false, baseKm: 0, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [], brand: '', model: '', year: '' },
+    { id: 'TAXI 2', outOfService: false, baseKm: 0, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [], brand: '', model: '', year: '' },
+    { id: 'TAXI 3', outOfService: false, baseKm: 0, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [], brand: '', model: '', year: '' },
   ],
   shifts: [], // {id, driverId, car, date, startTime, endTime, startKm, endKm, startCash, cash, card, app, expenses, fuel, fuelReceiptPhoto, gpsStart, gpsEnd, status: 'active'|'closed'|'locked', notes}
   bookings: [], // driver-logged completed rides during a shift: {id, shiftId, driverId, flightNumber, arrivalTime, customerName, passengers, destination, price, notes, status:'open'|'done'}
@@ -86,9 +86,9 @@ function isoDateStr(d) {
   return `${y}-${m}-${day}`;
 }
 function dmy(isoStr) {
-  // yyyy-mm-dd -> dd/mm, for display only (storage/sorting stays yyyy-mm-dd)
-  const [, m, d] = isoStr.split('-');
-  return `${d}/${m}`;
+  // yyyy-mm-dd -> D/M/YYYY (no leading zeros), for display only
+  const [y, m, d] = isoStr.split('-');
+  return `${Number(d)}/${Number(m)}/${y}`;
 }
 function mondayOf(dateStr) {
   const d = new Date(dateStr + 'T00:00:00');
@@ -1483,9 +1483,43 @@ function EditScheduleEntryModal({ state, persist, weekStart, driverId, day, entr
 }
 
 // ---------- Στόλος & Οδηγοί (διαχείριση) ----------
+function EditCarModal({ state, persist, car, onClose }) {
+  const [brand, setBrand] = useState(car.brand || '');
+  const [model, setModel] = useState(car.model || '');
+  const [year, setYear] = useState(car.year || '');
+
+  const save = async () => {
+    await persist({ ...state, cars: state.cars.map(c => c.id === car.id ? { ...c, brand, model, year } : c) });
+    onClose();
+  };
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'flex-end', justifyContent: 'center', zIndex: 50 }}>
+      <div style={{ background: BG, border: `1px solid ${BORDER}`, borderRadius: '20px 20px 0 0', padding: 24, width: '100%', maxWidth: 480, maxHeight: '90vh', overflowY: 'auto' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+          <div style={{ color: TEXT, fontSize: 17, fontWeight: 700 }}>Στοιχεία {car.id}</div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer' }}><X size={20} /></button>
+        </div>
+
+        <label style={label}>Μάρκα</label>
+        <input value={brand} onChange={e => setBrand(e.target.value)} style={input} placeholder="π.χ. Toyota" />
+
+        <label style={label}>Μοντέλο</label>
+        <input value={model} onChange={e => setModel(e.target.value)} style={input} placeholder="π.χ. Corolla" />
+
+        <label style={label}>Χρονολογία</label>
+        <input value={year} onChange={e => setYear(e.target.value)} style={input} placeholder="π.χ. 2020" />
+
+        <button onClick={save} style={{ ...btnPrimary, justifyContent: 'center' }}>Αποθήκευση</button>
+      </div>
+    </div>
+  );
+}
+
 function FleetTab({ state, persist }) {
   const [editingDriver, setEditingDriver] = useState(null); // driver object or 'new'
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+  const [editingCar, setEditingCar] = useState(null); // car object being edited
 
   const activeShiftForCar = (carId) => state.shifts.find(s => s.car === carId && s.status === 'active');
 
@@ -1497,7 +1531,7 @@ function FleetTab({ state, persist }) {
     const label = prompt('Όνομα νέου οχήματος (π.χ. TAXI 4)');
     if (!label) return;
     if (state.cars.some(c => c.id === label)) { alert('Υπάρχει ήδη όχημα με αυτό το όνομα.'); return; }
-    await persist({ ...state, cars: [...state.cars, { id: label, outOfService: false, baseKm: 0, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [] }] });
+    await persist({ ...state, cars: [...state.cars, { id: label, outOfService: false, baseKm: 0, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [], brand: '', model: '', year: '' }] });
   };
 
   const removeCar = async (carId) => {
@@ -1538,18 +1572,26 @@ function FleetTab({ state, persist }) {
           const occDriver = occ && state.drivers.find(d => d.id === occ.driverId);
           return (
           <div key={c.id} style={{ background: CARD, borderRadius: 10, padding: '12px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', border: `1px solid ${BORDER}` }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <Car size={16} color={c.outOfService ? MUTE : (occ ? GREEN : ACCENT)} />
-              <span style={{ color: TEXT, fontSize: 14, fontWeight: 600 }}>{c.id}</span>
-              {c.outOfService && <span style={{ background: 'rgba(193,84,60,0.15)', color: RED, padding: '2px 7px', borderRadius: 5, fontSize: 11, fontWeight: 600 }}>Εκτός λειτουργίας</span>}
-              {!c.outOfService && occ && (
-                <span style={{ background: 'rgba(74,155,110,0.15)', color: GREEN, padding: '2px 7px', borderRadius: 5, fontSize: 11, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4 }}>
-                  <span style={{ width: 6, height: 6, borderRadius: '50%', background: GREEN, display: 'inline-block' }} />
-                  Ενεργός — {occDriver?.name || '—'}
-                </span>
+            <div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <Car size={16} color={c.outOfService ? MUTE : (occ ? GREEN : ACCENT)} />
+                <span style={{ color: TEXT, fontSize: 14, fontWeight: 600 }}>{c.id}</span>
+                {c.outOfService && <span style={{ background: 'rgba(193,84,60,0.15)', color: RED, padding: '2px 7px', borderRadius: 5, fontSize: 11, fontWeight: 600 }}>Εκτός λειτουργίας</span>}
+                {!c.outOfService && occ && (
+                  <span style={{ background: 'rgba(74,155,110,0.15)', color: GREEN, padding: '2px 7px', borderRadius: 5, fontSize: 11, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4 }}>
+                    <span style={{ width: 6, height: 6, borderRadius: '50%', background: GREEN, display: 'inline-block' }} />
+                    Ενεργός — {occDriver?.name || '—'}
+                  </span>
+                )}
+              </div>
+              {(c.brand || c.model || c.year) && (
+                <div style={{ color: MUTE, fontSize: 12, marginTop: 3, marginLeft: 26 }}>
+                  {[c.brand, c.model, c.year].filter(Boolean).join(' · ')}
+                </div>
               )}
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
+              <button onClick={() => setEditingCar(c)} style={smallBtn(MUTE)}>Επεξεργασία</button>
               <button onClick={() => toggleCarService(c.id)} disabled={!!occ} title={occ ? 'Δεν μπορεί να αλλάξει ενόσω είναι σε βάρδια' : ''} style={{ ...smallBtn(c.outOfService ? GREEN : RED), opacity: occ ? 0.4 : 1, cursor: occ ? 'not-allowed' : 'pointer' }}>
                 {c.outOfService ? 'Επαναφορά' : 'Εκτός λειτουργίας'}
               </button>
@@ -1559,6 +1601,7 @@ function FleetTab({ state, persist }) {
           );
         })}
       </div>
+      {editingCar && <EditCarModal state={state} persist={persist} car={editingCar} onClose={() => setEditingCar(null)} />}
 
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
         <div style={{ color: TEXT, fontSize: 15, fontWeight: 700 }}>Οδηγοί</div>
