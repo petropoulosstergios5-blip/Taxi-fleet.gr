@@ -131,8 +131,13 @@ function carLabelById(state, carId) {
 function getCarCurrentKm(state, carId) {
   const car = state.cars.find(c => c.id === carId);
   let max = car?.baseKm || 0;
+  const setAt = car?.baseKmSetAt || null;
   for (const s of state.shifts) {
     if (s.car !== carId) continue;
+    // If the admin has manually set a km value, ignore any shift reading from before
+    // that moment — this is what makes it a real override, not just a floor.
+    const ts = s.endTime || s.startTime;
+    if (setAt && ts && ts < setAt) continue;
     if (s.endKm != null && s.endKm > max) max = s.endKm;
     if (s.startKm != null && s.startKm > max) max = s.startKm;
   }
@@ -1184,7 +1189,7 @@ function MaintenanceTab({ state, persist }) {
 
   const saveKm = async (carId) => {
     if (kmDraft === '' || isNaN(Number(kmDraft))) { setEditingKmFor(null); return; }
-    await persist({ ...state, cars: state.cars.map(c => c.id === carId ? { ...c, baseKm: Number(kmDraft) } : c) });
+    await persist({ ...state, cars: state.cars.map(c => c.id === carId ? { ...c, baseKm: Number(kmDraft), baseKmSetAt: new Date().toISOString() } : c) });
     setEditingKmFor(null);
   };
 
