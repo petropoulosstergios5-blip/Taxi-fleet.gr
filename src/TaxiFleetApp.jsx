@@ -107,7 +107,7 @@ const DAY_LABELS_FULL = ['Δευτέρα', 'Τρίτη', 'Τετάρτη', 'Πέ
 function timeToMin(t) { const [h, m] = t.split(':').map(Number); return h * 60 + m; }
 function apptRange(a) {
   const start = timeToMin(a.time);
-  return [start, start + (a.durationMin || 60)];
+  return [start, start + (Number(a.durationMin) || 60)];
 }
 function rangesOverlap(a, b) { return a[0] < b[1] && b[0] < a[1]; }
 
@@ -570,7 +570,7 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                       <div>
                         <div style={{ color: TEXT, fontSize: 14, fontWeight: 700 }}>{a.time} · {a.pickup} → {a.dropoff}</div>
-                        <div style={{ color: MUTE, fontSize: 12, marginTop: 2 }}>{a.customerName}</div>
+                        <div style={{ color: MUTE, fontSize: 12, marginTop: 2 }}>{a.customerName}{a.passengers ? ` · ${a.passengers} επιβ.` : ''}</div>
                       </div>
                       <span style={{ background: `${meta.color}22`, color: meta.color, padding: '3px 8px', borderRadius: 6, fontSize: 11, fontWeight: 600 }}>{meta.label}</span>
                     </div>
@@ -1709,6 +1709,7 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
   const [driverId, setDriverId] = useState(appointment?.driverId || '');
   const [car, setCar] = useState(appointment?.car || '');
   const [notes, setNotes] = useState(appointment?.notes || '');
+  const [passengers, setPassengers] = useState(appointment?.passengers || 1);
   const [error, setError] = useState('');
 
   const conflict = useMemo(() => {
@@ -1733,7 +1734,7 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
           ...a,
           date, time, durationMin: Number(durationMin),
           customerName, pickup, dropoff, driverId: driverId || null, car: car || null,
-          notes,
+          notes, passengers: Number(passengers),
           status: wasUnassigned && nowAssigned ? 'assigned' : a.status,
           assignedAt: wasUnassigned && nowAssigned ? new Date().toISOString() : a.assignedAt,
         } : a),
@@ -1744,7 +1745,7 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
         date, time, durationMin: Number(durationMin),
         customerName, pickup, dropoff, driverId: driverId || null, car: car || null,
         status: driverId || car ? 'assigned' : 'pending',
-        notes,
+        notes, passengers: Number(passengers),
         createdAt: new Date().toISOString(),
         assignedAt: (driverId || car) ? new Date().toISOString() : null,
         acceptedAt: null, arrivedAt: null, completedAt: null,
@@ -1779,6 +1780,11 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
 
         <label style={label}>Όνομα πελάτη</label>
         <input value={customerName} onChange={e => setCustomerName(e.target.value)} style={input} placeholder="π.χ. Κος Αντωνίου" />
+
+        <label style={label}>Αριθμός επιβατών</label>
+        <select value={passengers} onChange={e => setPassengers(e.target.value)} style={input}>
+          {[1, 2, 3, 4, 5, 6, 7, 8].map(n => <option key={n} value={n}>{n}</option>)}
+        </select>
 
         <div style={{ display: 'flex', gap: 10 }}>
           <div style={{ flex: 1 }}>
@@ -1865,7 +1871,7 @@ function CalendarTab({ state, persist }) {
   const [prefillTime, setPrefillTime] = useState('10:00');
   const [editingAppt, setEditingAppt] = useState(null);
 
-  const hours = Array.from({ length: 15 }, (_, i) => 7 + i); // 07:00 - 21:00
+  const hours = Array.from({ length: 24 }, (_, i) => i); // 00:00 - 23:00
   const cars = state.cars.map(c => c.id);
   const isToday = date === isoDateStr(new Date());
   const activeShiftForCar = (carId) => state.shifts.find(s => s.car === carId && s.status === 'active');
@@ -2054,7 +2060,7 @@ function AppointmentsHistoryTab({ state, persist }) {
                 <div>
                   <div style={{ color: TEXT, fontSize: 14, fontWeight: 700 }}>{dmy(a.date)} · {a.time}</div>
                   <div style={{ color: MUTE, fontSize: 13, marginTop: 2 }}>{a.pickup} → {a.dropoff}</div>
-                  <div style={{ color: MUTE, fontSize: 12, marginTop: 4 }}>{a.customerName}</div>
+                  <div style={{ color: MUTE, fontSize: 12, marginTop: 4 }}>{a.customerName}{a.passengers ? ` · ${a.passengers} επιβ.` : ''}</div>
                 </div>
                 <span style={{ background: `${meta.color}22`, color: meta.color, padding: '3px 8px', borderRadius: 6, fontSize: 11, fontWeight: 600 }}>{meta.label}</span>
               </div>
