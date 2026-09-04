@@ -392,7 +392,7 @@ function LoginScreen({ drivers, onLogin }) {
     <div style={{ minHeight: '100vh', background: BG, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 24, ...fontStack }}>
       <div style={{ width: '100%', maxWidth: 380 }}>
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6, marginBottom: 32 }}>
-          <img src="/logo-yellow.png" alt="Taxi Thessaloniki.GR" style={{ height: 90, width: 'auto' }} />
+          <img src="/logo-yellow.png" alt="Taxi Thessaloniki.GR" style={{ maxHeight: 90, maxWidth: '70vw', width: 'auto', height: 'auto' }} />
           <div style={{ color: MUTE, fontSize: 13 }}>Σύνδεση</div>
         </div>
 
@@ -554,7 +554,7 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6, padding: '14px 20px 0' }}>
-        <img src="/logo-yellow.png" alt="Taxi Thessaloniki.GR" style={{ height: 44, width: 'auto' }} />
+        <img src="/logo-yellow.png" alt="Taxi Thessaloniki.GR" style={{ maxHeight: 44, maxWidth: '60vw', width: 'auto', height: 'auto' }} />
         <LiveClock />
       </div>
 
@@ -1050,14 +1050,14 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
 
   return (
     <div style={{ minHeight: '100vh', background: BG, ...fontStack }}>
-      <div style={{ padding: 20, display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: `1px solid ${CARD}` }}>
+      <div style={{ padding: 20, display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: `1px solid ${CARD}`, flexWrap: 'wrap', rowGap: 10 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <div style={{ width: 36, height: 36, borderRadius: 8, background: ACCENT, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ width: 36, height: 36, borderRadius: 8, background: ACCENT, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
             <Gauge size={18} color={BG} strokeWidth={2.5} />
           </div>
           <div style={{ color: TEXT, fontSize: 17, fontWeight: 700 }}>Πίνακας διαχείρισης</div>
         </div>
-        <img src="/logo-yellow.png" alt="Taxi Thessaloniki.GR" style={{ height: 56, width: 'auto' }} />
+        <img src="/logo-yellow.png" alt="Taxi Thessaloniki.GR" style={{ maxHeight: 56, maxWidth: '40vw', width: 'auto', height: 'auto' }} />
         <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
           <LiveClock />
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
