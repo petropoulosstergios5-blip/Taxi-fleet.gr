@@ -312,6 +312,24 @@ export default function TaxiFleetApp() {
   return <AdminApp state={state} persist={persist} onLogout={() => setSession(null)} cloudStatus={cloudStatus} />;
 }
 
+const DAY_NAMES_GEN = ['Κυριακή', 'Δευτέρα', 'Τρίτη', 'Τετάρτη', 'Πέμπτη', 'Παρασκευή', 'Σάββατο'];
+function LiveClock() {
+  const [now, setNow] = useState(new Date());
+  useEffect(() => {
+    const id = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const pad = n => String(n).padStart(2, '0');
+  const timeStr = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  const dateStr = `${DAY_NAMES_GEN[now.getDay()]} ${pad(now.getDate())}/${pad(now.getMonth() + 1)}`;
+  return (
+    <div style={{ textAlign: 'center' }}>
+      <div style={{ fontFamily: 'monospace', fontSize: 20, fontWeight: 700, color: ACCENT, letterSpacing: 1 }}>{timeStr}</div>
+      <div style={{ fontSize: 11, color: MUTE }}>{dateStr}</div>
+    </div>
+  );
+}
+
 function CloudBadge({ status }) {
   const meta = status === 'online'
     ? { color: '#4A9B6E', label: 'Συγχρονισμένο' }
@@ -353,14 +371,9 @@ function LoginScreen({ drivers, onLogin }) {
   return (
     <div style={{ minHeight: '100vh', background: BG, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 24, ...fontStack }}>
       <div style={{ width: '100%', maxWidth: 380 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 32, justifyContent: 'center' }}>
-          <div style={{ width: 44, height: 44, borderRadius: 10, background: ACCENT, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <Car size={24} color={BG} strokeWidth={2.5} />
-          </div>
-          <div>
-            <div style={{ color: TEXT, fontSize: 20, fontWeight: 700 }}>Ταξί Στόλος</div>
-            <div style={{ color: MUTE, fontSize: 13 }}>Σύνδεση</div>
-          </div>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6, marginBottom: 32 }}>
+          <img src="/logo-yellow.png" alt="Taxi Thessaloniki.GR" style={{ height: 90, width: 'auto' }} />
+          <div style={{ color: MUTE, fontSize: 13 }}>Σύνδεση</div>
         </div>
 
         {!mode ? (
@@ -518,6 +531,11 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
           </button>
           <CloudBadge status={cloudStatus} />
         </div>
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6, padding: '14px 20px 0' }}>
+        <img src="/logo-yellow.png" alt="Taxi Thessaloniki.GR" style={{ height: 44, width: 'auto' }} />
+        <LiveClock />
       </div>
 
       <div style={{ padding: 20 }}>
@@ -1019,11 +1037,15 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
           </div>
           <div style={{ color: TEXT, fontSize: 17, fontWeight: 700 }}>Πίνακας διαχείρισης</div>
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
-          <button onClick={onLogout} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4, fontSize: 13 }}>
-            <LogOut size={16} /> Έξοδος
-          </button>
-          <CloudBadge status={cloudStatus} />
+        <img src="/logo-yellow.png" alt="Taxi Thessaloniki.GR" style={{ height: 56, width: 'auto' }} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          <LiveClock />
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
+            <button onClick={onLogout} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4, fontSize: 13 }}>
+              <LogOut size={16} /> Έξοδος
+            </button>
+            <CloudBadge status={cloudStatus} />
+          </div>
         </div>
       </div>
 
