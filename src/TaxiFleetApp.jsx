@@ -32,9 +32,9 @@ const seedDrivers = [
 const initialState = {
   drivers: seedDrivers,
   cars: [
-    { id: 'TAXI 1', outOfService: false, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [] },
-    { id: 'TAXI 2', outOfService: false, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [] },
-    { id: 'TAXI 3', outOfService: false, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [] },
+    { id: 'TAXI 1', outOfService: false, baseKm: 0, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [] },
+    { id: 'TAXI 2', outOfService: false, baseKm: 0, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [] },
+    { id: 'TAXI 3', outOfService: false, baseKm: 0, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [] },
   ],
   shifts: [], // {id, driverId, car, date, startTime, endTime, startKm, endKm, startCash, cash, card, app, expenses, fuel, fuelReceiptPhoto, gpsStart, gpsEnd, status: 'active'|'closed'|'locked', notes}
   bookings: [], // driver-logged completed rides during a shift: {id, shiftId, driverId, flightNumber, arrivalTime, customerName, passengers, destination, price, notes, status:'open'|'done'}
@@ -71,10 +71,12 @@ function rangesOverlap(a, b) { return a[0] < b[1] && b[0] < a[1]; }
 
 // Core conflict check used both for live validation and final save-blocking.
 // Returns { ok: true } or { ok: false, reason: string }
-// Current odometer reading for a car = the highest km ever logged against it,
-// across all shifts (closed shifts' endKm, or an active shift's startKm if higher).
+// Current odometer reading for a car = the highest of: the admin-set baseline (car.baseKm,
+// used e.g. when a car is first added to the fleet), or the highest km ever logged against
+// it across all shifts (closed shifts' endKm, or an active shift's startKm if higher).
 function getCarCurrentKm(state, carId) {
-  let max = 0;
+  const car = state.cars.find(c => c.id === carId);
+  let max = car?.baseKm || 0;
   for (const s of state.shifts) {
     if (s.car !== carId) continue;
     if (s.endKm != null && s.endKm > max) max = s.endKm;
@@ -392,7 +394,7 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
       date: todayStr(),
       startTime: new Date().toISOString(),
       endTime: null,
-      startKm: Number(payload.startKm),
+      startKm: getCarCurrentKm(state, payload.car),
       endKm: null,
       startCash: Number(payload.startCash) || 0,
       cash: null, card: null, app: null,
@@ -432,7 +434,7 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
     setScreen('home');
   };
 
-  if (screen === 'startShift') return <StartShiftScreen driver={driver} cars={state.cars} activeShifts={state.shifts.filter(s => s.status === 'active')} onBack={() => setScreen('home')} onSubmit={startShift} />;
+  if (screen === 'startShift') return <StartShiftScreen state={state} driver={driver} cars={state.cars} activeShifts={state.shifts.filter(s => s.status === 'active')} onBack={() => setScreen('home')} onSubmit={startShift} />;
   if (screen === 'booking') return <BookingScreen driver={driver} shift={activeShift} onBack={() => setScreen('home')} onSubmit={addBooking} />;
   if (screen === 'endShift') return <EndShiftScreen driver={driver} shift={activeShift} onBack={() => setScreen('home')} onSubmit={closeShift} />;
   if (screen === 'history') return <HistoryScreen state={state} driverId={driverId} onBack={() => setScreen('home')} />;
@@ -567,13 +569,12 @@ function captureGPS() {
   });
 }
 
-function StartShiftScreen({ driver, cars, activeShifts, onBack, onSubmit }) {
+function StartShiftScreen({ state, driver, cars, activeShifts, onBack, onSubmit }) {
   const occupiedCarIds = new Set(activeShifts.map(s => s.car));
   const availableCars = cars.filter(c => !c.outOfService && !occupiedCarIds.has(c.id));
   const [selectedCar, setSelectedCar] = useState(
     availableCars.some(c => c.id === driver.car) ? driver.car : (availableCars[0]?.id || '')
   );
-  const [startKm, setStartKm] = useState('');
   const [startCash, setStartCash] = useState('');
   const [gps, setGps] = useState(null);
   const [gpsStatus, setGpsStatus] = useState('idle');
@@ -585,7 +586,8 @@ function StartShiftScreen({ driver, cars, activeShifts, onBack, onSubmit }) {
     setGpsStatus(p ? 'ok' : 'error');
   };
 
-  const canSubmit = selectedCar && startKm !== '' && startCash !== '';
+  const startKmPreview = selectedCar ? getCarCurrentKm(state, selectedCar) : 0;
+  const canSubmit = selectedCar && startCash !== '';
 
   return (
     <Screen title="Έναρξη Βάρδιας" subtitle={selectedCar || 'Επιλογή οχήματος'} onBack={onBack}>
@@ -603,9 +605,7 @@ function StartShiftScreen({ driver, cars, activeShifts, onBack, onSubmit }) {
       )}
       <Row label="Ημερομηνία" value={todayStr()} />
       <Row label="Ώρα έναρξης" value={new Date().toLocaleTimeString('el-GR', { hour: '2-digit', minute: '2-digit' })} />
-
-      <label style={label}>Χιλιόμετρα έναρξης</label>
-      <input type="number" value={startKm} onChange={e => setStartKm(e.target.value)} placeholder="π.χ. 154230" style={input} />
+      <Row label="Χιλιόμετρα έναρξης" value={`${startKmPreview.toLocaleString('el-GR')} χλμ (αυτόματα, από το όχημα)`} />
 
       <label style={label}>Αρχικό ταμείο (€)</label>
       <input type="number" value={startCash} onChange={e => setStartCash(e.target.value)} placeholder="π.χ. 50" style={input} />
@@ -613,7 +613,7 @@ function StartShiftScreen({ driver, cars, activeShifts, onBack, onSubmit }) {
       <GPSButton status={gpsStatus} onClick={grabGPS} gps={gps} label="Καταγραφή θέσης έναρξης (GPS)" />
 
       <button
-        onClick={() => canSubmit && onSubmit({ car: selectedCar, startKm, startCash, gps })}
+        onClick={() => canSubmit && onSubmit({ car: selectedCar, startCash, gps })}
         disabled={!canSubmit}
         style={{ ...btnPrimary, justifyContent: 'center', marginTop: 12, opacity: canSubmit ? 1 : 0.5, cursor: canSubmit ? 'pointer' : 'not-allowed' }}
       >
@@ -919,8 +919,8 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
         {tab === 'map' && <FleetMapTab state={state} />}
         {tab === 'calendar' && <CalendarTab state={state} persist={persist} />}
         {tab === 'appointments' && <AppointmentsHistoryTab state={state} persist={persist} />}
-        {tab === 'shifts' && <AllShiftsTab state={state} onLock={lockShift} onUnlock={unlockShift} />}
-        {tab === 'bookings' && <BookingsTab state={state} />}
+        {tab === 'shifts' && <AllShiftsTab state={state} persist={persist} onLock={lockShift} onUnlock={unlockShift} />}
+        {tab === 'bookings' && <BookingsTab state={state} persist={persist} />}
         {tab === 'reports' && <ReportsTab state={state} />}
         {tab === 'fleet' && <FleetTab state={state} persist={persist} />}
         {tab === 'maintenance' && <MaintenanceTab state={state} persist={persist} />}
@@ -992,9 +992,22 @@ function MaintenanceTab({ state, persist }) {
   const [svcKm, setSvcKm] = useState('');
   const [svcDesc, setSvcDesc] = useState('');
   const [svcCost, setSvcCost] = useState('');
+  const [editingKmFor, setEditingKmFor] = useState(null); // car id whose km field is being edited
+  const [kmDraft, setKmDraft] = useState('');
 
   const setInterval_ = async (carId, km) => {
     await persist({ ...state, cars: state.cars.map(c => c.id === carId ? { ...c, serviceIntervalKm: Number(km) } : c) });
+  };
+
+  const startEditKm = (carId, currentValue) => {
+    setEditingKmFor(carId);
+    setKmDraft(String(currentValue));
+  };
+
+  const saveKm = async (carId) => {
+    if (kmDraft === '' || isNaN(Number(kmDraft))) { setEditingKmFor(null); return; }
+    await persist({ ...state, cars: state.cars.map(c => c.id === carId ? { ...c, baseKm: Number(kmDraft) } : c) });
+    setEditingKmFor(null);
   };
 
   const openForm = (carId, defaultKm) => {
@@ -1042,8 +1055,22 @@ function MaintenanceTab({ state, persist }) {
                 <span style={{ background: `${statusMeta.color}22`, color: statusMeta.color, padding: '3px 9px', borderRadius: 6, fontSize: 12, fontWeight: 700 }}>{statusMeta.label}</span>
               </div>
 
-              <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap', marginBottom: 10 }}>
-                <MiniStat label="Τρέχοντα χλμ" value={currentKm.toLocaleString('el-GR')} />
+              <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap', marginBottom: 10, alignItems: 'center' }}>
+                {editingKmFor === c.id ? (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <label style={{ ...label, marginBottom: 0 }}>Χλμ οχήματος</label>
+                    <input type="number" value={kmDraft} onChange={e => setKmDraft(e.target.value)} style={{ ...input, marginBottom: 0, width: 120, padding: '6px 10px' }} autoFocus />
+                    <button onClick={() => saveKm(c.id)} style={smallBtn(GREEN)}>Αποθήκευση</button>
+                    <button onClick={() => setEditingKmFor(null)} style={smallBtn(MUTE)}>Άκυρο</button>
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <MiniStat label="Τρέχοντα χλμ" value={currentKm.toLocaleString('el-GR')} />
+                    <button onClick={() => startEditKm(c.id, currentKm)} title="Χειροκίνητη διόρθωση χιλιομέτρων" style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer', padding: 2, fontSize: 13 }}>
+                      ✏️
+                    </button>
+                  </div>
+                )}
                 <MiniStat label="Τελευταίο service" value={lastServiceKm ? `${lastServiceKm.toLocaleString('el-GR')} χλμ` : '—'} />
                 <MiniStat label="Από τελευταίο service" value={`${sinceService.toLocaleString('el-GR')} / ${interval.toLocaleString('el-GR')} χλμ`} color={statusMeta.color} />
               </div>
@@ -1121,7 +1148,7 @@ function FleetTab({ state, persist }) {
     const label = prompt('Όνομα νέου οχήματος (π.χ. TAXI 4)');
     if (!label) return;
     if (state.cars.some(c => c.id === label)) { alert('Υπάρχει ήδη όχημα με αυτό το όνομα.'); return; }
-    await persist({ ...state, cars: [...state.cars, { id: label, outOfService: false, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [] }] });
+    await persist({ ...state, cars: [...state.cars, { id: label, outOfService: false, baseKm: 0, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [] }] });
   };
 
   const removeCar = async (carId) => {
@@ -1689,11 +1716,12 @@ function MiniStat({ label, value, color }) {
   );
 }
 
-function AllShiftsTab({ state, onLock, onUnlock }) {
+function AllShiftsTab({ state, persist, onLock, onUnlock }) {
   const [filterDriver, setFilterDriver] = useState('');
   const [filterCar, setFilterCar] = useState('');
   const [filterFrom, setFilterFrom] = useState('');
   const [filterTo, setFilterTo] = useState('');
+  const [editingShift, setEditingShift] = useState(null);
 
   const sorted = state.shifts
     .filter(s => !filterDriver || s.driverId === filterDriver)
@@ -1743,6 +1771,7 @@ function AllShiftsTab({ state, onLock, onUnlock }) {
                   <td style={td}>
                     {s.status === 'closed' && <button onClick={() => onLock(s.id)} style={smallBtn(ACCENT)}>Κλείδωμα</button>}
                     {s.status === 'locked' && <button onClick={() => onUnlock(s.id)} style={smallBtn(MUTE)}>Ξεκλείδωμα</button>}
+                    {' '}<button onClick={() => setEditingShift(s)} style={smallBtn(MUTE)}>Επεξεργασία</button>
                   </td>
                 </tr>
               );
@@ -1751,13 +1780,105 @@ function AllShiftsTab({ state, onLock, onUnlock }) {
         </table>
         {sorted.length === 0 && <div style={{ color: MUTE, fontSize: 13, padding: '16px 0' }}>Καμία βάρδια ακόμα</div>}
       </div>
+      {editingShift && <EditShiftModal state={state} persist={persist} shift={editingShift} onClose={() => setEditingShift(null)} />}
     </div>
   );
 }
 const td = { padding: '10px', color: TEXT };
 const smallBtn = (color) => ({ background: 'none', border: `1px solid ${color}`, color, borderRadius: 6, padding: '5px 10px', fontSize: 11, fontWeight: 700, cursor: 'pointer' });
 
-function BookingsTab({ state }) {
+function EditShiftModal({ state, persist, shift, onClose }) {
+  const [car, setCar] = useState(shift.car);
+  const [startKm, setStartKm] = useState(String(shift.startKm ?? ''));
+  const [endKm, setEndKm] = useState(shift.endKm != null ? String(shift.endKm) : '');
+  const [cash, setCash] = useState(shift.cash != null ? String(shift.cash) : '');
+  const [card, setCard] = useState(shift.card != null ? String(shift.card) : '');
+  const [app, setApp] = useState(shift.app != null ? String(shift.app) : '');
+  const [expenses, setExpenses] = useState(shift.expenses != null ? String(shift.expenses) : '');
+  const [fuel, setFuel] = useState(shift.fuel != null ? String(shift.fuel) : '');
+  const [notes, setNotes] = useState(shift.notes || '');
+
+  const save = async () => {
+    await persist({
+      ...state,
+      shifts: state.shifts.map(s => s.id === shift.id ? {
+        ...s,
+        car,
+        startKm: startKm === '' ? s.startKm : Number(startKm),
+        endKm: endKm === '' ? null : Number(endKm),
+        cash: cash === '' ? null : Number(cash),
+        card: card === '' ? null : Number(card),
+        app: app === '' ? null : Number(app),
+        expenses: expenses === '' ? null : Number(expenses),
+        fuel: fuel === '' ? null : Number(fuel),
+        notes,
+      } : s),
+    });
+    onClose();
+  };
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'flex-end', justifyContent: 'center', zIndex: 50 }}>
+      <div style={{ background: BG, border: `1px solid ${BORDER}`, borderRadius: '20px 20px 0 0', padding: 24, width: '100%', maxWidth: 480, maxHeight: '90vh', overflowY: 'auto' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+          <div style={{ color: TEXT, fontSize: 17, fontWeight: 700 }}>Επεξεργασία βάρδιας</div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer' }}><X size={20} /></button>
+        </div>
+
+        <label style={label}>Όχημα</label>
+        <select value={car} onChange={e => setCar(e.target.value)} style={input}>
+          {state.cars.map(c => <option key={c.id} value={c.id}>{c.id}</option>)}
+        </select>
+
+        <div style={{ display: 'flex', gap: 10 }}>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Χλμ έναρξης</label>
+            <input type="number" value={startKm} onChange={e => setStartKm(e.target.value)} style={input} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Χλμ τέλους</label>
+            <input type="number" value={endKm} onChange={e => setEndKm(e.target.value)} style={input} placeholder="—" />
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', gap: 10 }}>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Μετρητά (€)</label>
+            <input type="number" value={cash} onChange={e => setCash(e.target.value)} style={{ ...input, marginBottom: 0 }} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Κάρτες (€)</label>
+            <input type="number" value={card} onChange={e => setCard(e.target.value)} style={{ ...input, marginBottom: 0 }} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={label}>App (€)</label>
+            <input type="number" value={app} onChange={e => setApp(e.target.value)} style={{ ...input, marginBottom: 0 }} />
+          </div>
+        </div>
+        <div style={{ height: 16 }} />
+
+        <div style={{ display: 'flex', gap: 10 }}>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Έξοδα (€)</label>
+            <input type="number" value={expenses} onChange={e => setExpenses(e.target.value)} style={input} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Πετρέλαιο (€)</label>
+            <input type="number" value={fuel} onChange={e => setFuel(e.target.value)} style={input} />
+          </div>
+        </div>
+
+        <label style={label}>Σημειώσεις</label>
+        <input value={notes} onChange={e => setNotes(e.target.value)} style={input} />
+
+        <button onClick={save} style={{ ...btnPrimary, justifyContent: 'center' }}>Αποθήκευση αλλαγών</button>
+      </div>
+    </div>
+  );
+}
+
+function BookingsTab({ state, persist }) {
+  const [editingBooking, setEditingBooking] = useState(null);
   const sorted = state.bookings.slice().sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   return (
     <div>
@@ -1779,10 +1900,83 @@ function BookingsTab({ state }) {
                 <div style={{ color: GREEN, fontSize: 15, fontWeight: 700 }}>{fmtEUR(b.price)}</div>
               </div>
               {b.notes && <div style={{ color: MUTE, fontSize: 12, marginTop: 8, borderTop: `1px solid ${BORDER}`, paddingTop: 8 }}>{b.notes}</div>}
+              <div style={{ marginTop: 10 }}>
+                <button onClick={() => setEditingBooking(b)} style={smallBtn(MUTE)}>Επεξεργασία</button>
+              </div>
             </div>
           );
         })}
         {sorted.length === 0 && <div style={{ color: MUTE, fontSize: 13 }}>Καμία προμίσθωση ακόμα</div>}
+      </div>
+      {editingBooking && <EditBookingModal state={state} persist={persist} booking={editingBooking} onClose={() => setEditingBooking(null)} />}
+    </div>
+  );
+}
+
+function EditBookingModal({ state, persist, booking, onClose }) {
+  const [flightNumber, setFlightNumber] = useState(booking.flightNumber || '');
+  const [arrivalTime, setArrivalTime] = useState(booking.arrivalTime || '');
+  const [customerName, setCustomerName] = useState(booking.customerName || '');
+  const [passengers, setPassengers] = useState(String(booking.passengers ?? ''));
+  const [destination, setDestination] = useState(booking.destination || '');
+  const [price, setPrice] = useState(String(booking.price ?? ''));
+  const [notes, setNotes] = useState(booking.notes || '');
+
+  const save = async () => {
+    await persist({
+      ...state,
+      bookings: state.bookings.map(b => b.id === booking.id ? {
+        ...b,
+        flightNumber, arrivalTime, customerName,
+        passengers: passengers === '' ? b.passengers : Number(passengers),
+        destination,
+        price: price === '' ? b.price : Number(price),
+        notes,
+      } : b),
+    });
+    onClose();
+  };
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'flex-end', justifyContent: 'center', zIndex: 50 }}>
+      <div style={{ background: BG, border: `1px solid ${BORDER}`, borderRadius: '20px 20px 0 0', padding: 24, width: '100%', maxWidth: 480, maxHeight: '90vh', overflowY: 'auto' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+          <div style={{ color: TEXT, fontSize: 17, fontWeight: 700 }}>Επεξεργασία προμίσθωσης</div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer' }}><X size={20} /></button>
+        </div>
+
+        <label style={label}>Όνομα πελάτη</label>
+        <input value={customerName} onChange={e => setCustomerName(e.target.value)} style={input} />
+
+        <label style={label}>Προορισμός</label>
+        <input value={destination} onChange={e => setDestination(e.target.value)} style={input} />
+
+        <div style={{ display: 'flex', gap: 10 }}>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Πτήση</label>
+            <input value={flightNumber} onChange={e => setFlightNumber(e.target.value)} style={input} placeholder="προαιρετικό" />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Ώρα άφιξης</label>
+            <input value={arrivalTime} onChange={e => setArrivalTime(e.target.value)} style={input} placeholder="π.χ. 14:30" />
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', gap: 10 }}>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Επιβάτες</label>
+            <input type="number" value={passengers} onChange={e => setPassengers(e.target.value)} style={input} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Τιμή (€)</label>
+            <input type="number" value={price} onChange={e => setPrice(e.target.value)} style={input} />
+          </div>
+        </div>
+
+        <label style={label}>Σημειώσεις</label>
+        <input value={notes} onChange={e => setNotes(e.target.value)} style={input} />
+
+        <button onClick={save} style={{ ...btnPrimary, justifyContent: 'center' }}>Αποθήκευση αλλαγών</button>
       </div>
     </div>
   );
