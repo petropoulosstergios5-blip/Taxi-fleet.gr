@@ -40,6 +40,7 @@ const initialState = {
   bookings: [], // driver-logged completed rides during a shift: {id, shiftId, driverId, flightNumber, arrivalTime, customerName, passengers, destination, price, notes, status:'open'|'done'}
   appointments: [], // admin-scheduled dispatch jobs: {id, date, time, durationMin, pickup, dropoff, customerName, driverId, car, status, notes,
                      //   createdAt, assignedAt, acceptedAt, arrivedAt, completedAt}
+  schedule: [], // weekly roster entries: {id, weekStart (Monday, ISO), driverId, day (0=Mon..6=Sun), slot: 'morning'|'night'|'rest', car}
 };
 
 const fontStack = { fontFamily: 'Inter, system-ui, sans-serif' };
@@ -62,6 +63,20 @@ function isoDateStr(d) {
   const dt = new Date(d);
   return dt.toISOString().slice(0, 10);
 }
+function mondayOf(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00');
+  const day = d.getDay(); // 0=Sun..6=Sat
+  const diff = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + diff);
+  return isoDateStr(d);
+}
+function addDaysIso(dateStr, n) {
+  const d = new Date(dateStr + 'T00:00:00');
+  d.setDate(d.getDate() + n);
+  return isoDateStr(d);
+}
+const DAY_LABELS_SHORT = ['Δευ', 'Τρι', 'Τετ', 'Πεμ', 'Παρ', 'Σαβ', 'Κυρ'];
+const DAY_LABELS_FULL = ['Δευτέρα', 'Τρίτη', 'Τετάρτη', 'Πέμπτη', 'Παρασκευή', 'Σάββατο', 'Κυριακή'];
 function timeToMin(t) { const [h, m] = t.split(':').map(Number); return h * 60 + m; }
 function apptRange(a) {
   const start = timeToMin(a.time);
@@ -119,6 +134,41 @@ function minToTime(mins) {
   const h = Math.floor(mins / 60) % 24;
   const m = mins % 60;
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
+
+// A shift is labeled "Πρωινή" or "Βραδινή" from its own start time — no fixed schedule,
+// just: starts before 15:00 → Πρωινή, otherwise → Βραδινή.
+function classifyShift(startTime) {
+  return timeToMin(startTime) < 15 * 60 ? 'Πρωινή' : 'Βραδινή';
+}
+
+// Uncovered stretches of a given day for a given car, based on all shift entries assigned
+// to it that day. An overnight shift (end time <= start time) is capped at 24:00 for this
+// day's view — the portion past midnight isn't carried into the next day's calculation.
+function computeCarGaps(schedule, weekStart, day, carId) {
+  const intervals = schedule
+    .filter(e => e.weekStart === weekStart && e.day === day && e.car === carId && e.type === 'shift' && e.startTime && e.endTime)
+    .map(e => {
+      const s = timeToMin(e.startTime);
+      let en = timeToMin(e.endTime);
+      if (en <= s) en = 24 * 60;
+      return [s, en];
+    })
+    .sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  for (const [s, e] of intervals) {
+    if (merged.length && s <= merged[merged.length - 1][1]) {
+      merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], e);
+    } else merged.push([s, e]);
+  }
+  const gaps = [];
+  let cursor = 0;
+  for (const [s, e] of merged) {
+    if (s > cursor) gaps.push([cursor, s]);
+    cursor = Math.max(cursor, e);
+  }
+  if (cursor < 24 * 60) gaps.push([cursor, 24 * 60]);
+  return gaps.map(([s, e]) => `${minToTime(s)}–${minToTime(e)}`);
 }
 
 const STATUS_META = {
@@ -434,6 +484,7 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
   if (screen === 'booking') return <BookingScreen driver={driver} shift={activeShift} onBack={() => setScreen('home')} onSubmit={addBooking} />;
   if (screen === 'endShift') return <EndShiftScreen driver={driver} shift={activeShift} onBack={() => setScreen('home')} onSubmit={closeShift} />;
   if (screen === 'history') return <HistoryScreen state={state} driverId={driverId} onBack={() => setScreen('home')} />;
+  if (screen === 'schedule') return <MyScheduleScreen state={state} driverId={driverId} onBack={() => setScreen('home')} />;
 
   return (
     <div style={{ minHeight: '100vh', background: BG, ...fontStack }}>
@@ -494,7 +545,7 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
               <div style={{ width: 8, height: 8, borderRadius: '50%', background: GREEN }} />
               <span style={{ color: GREEN, fontSize: 13, fontWeight: 600 }}>Βάρδια σε εξέλιξη — {activeShift.car}</span>
             </div>
-            <div style={{ color: TEXT, fontSize: 14 }}>Έναρξη {new Date(activeShift.startTime).toLocaleTimeString('el-GR', { hour: '2-digit', minute: '2-digit' })} · {activeShift.startKm} χλμ</div>
+            <div style={{ color: TEXT, fontSize: 14 }}>Έναρξη {new Date(activeShift.startTime).toLocaleTimeString('el-GR', { hour: '2-digit', minute: '2-digit', hour12: false })} · {activeShift.startKm} χλμ</div>
             <div style={{ color: MUTE, fontSize: 13, marginBottom: 16 }}>Αρχικό ταμείο: {fmtEUR(activeShift.startCash)}</div>
           </div>
         ) : (
@@ -520,6 +571,11 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
             label="Ιστορικό Βαρδιών"
             icon={Calendar}
             onClick={() => setScreen('history')}
+          />
+          <BigButton
+            label="Πρόγραμμά μου"
+            icon={Calendar}
+            onClick={() => setScreen('schedule')}
           />
           {activeShift && (
             <button onClick={() => setScreen('endShift')} style={{ ...btnPrimary, background: RED, color: '#fff', marginTop: 8 }}>
@@ -600,7 +656,7 @@ function StartShiftScreen({ state, driver, cars, activeShifts, onBack, onSubmit 
         </>
       )}
       <Row label="Ημερομηνία" value={todayStr()} />
-      <Row label="Ώρα έναρξης" value={new Date().toLocaleTimeString('el-GR', { hour: '2-digit', minute: '2-digit' })} />
+      <Row label="Ώρα έναρξης" value={new Date().toLocaleTimeString('el-GR', { hour: '2-digit', minute: '2-digit', hour12: false })} />
       <Row label="Χιλιόμετρα έναρξης" value={`${startKmPreview.toLocaleString('el-GR')} χλμ (αυτόματα, από το όχημα)`} />
 
       <label style={label}>Αρχικό ταμείο (€)</label>
@@ -616,6 +672,26 @@ function StartShiftScreen({ state, driver, cars, activeShifts, onBack, onSubmit 
         ✅ Έναρξη
       </button>
     </Screen>
+  );
+}
+
+// Custom 24h time picker — native <input type="time"> renders using the device's own
+// locale/clock preference (which is how "1:00 μ.μ." showed up), so we build our own to
+// guarantee a 24-hour display everywhere, on every phone.
+const HOURS_24 = Array.from({ length: 24 }, (_, i) => String(i).padStart(2, '0'));
+const MINUTES_5 = ['00', '05', '10', '15', '20', '25', '30', '35', '40', '45', '50', '55'];
+function Time24Input({ value, onChange }) {
+  const [h, m] = (value || '00:00').split(':');
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 16 }}>
+      <select value={h} onChange={e => onChange(`${e.target.value}:${m}`)} style={{ ...input, marginBottom: 0, width: 68, padding: '10px 6px' }}>
+        {HOURS_24.map(hh => <option key={hh} value={hh}>{hh}</option>)}
+      </select>
+      <span style={{ color: MUTE, fontWeight: 700 }}>:</span>
+      <select value={m} onChange={e => onChange(`${h}:${e.target.value}`)} style={{ ...input, marginBottom: 0, width: 68, padding: '10px 6px' }}>
+        {MINUTES_5.map(mm => <option key={mm} value={mm}>{mm}</option>)}
+      </select>
+    </div>
   );
 }
 
@@ -659,7 +735,7 @@ function BookingScreen({ driver, shift, onBack, onSubmit }) {
       <input value={flightNumber} onChange={e => setFlightNumber(e.target.value)} placeholder="π.χ. A3 654" style={input} />
 
       <label style={label}>Ώρα άφιξης (προαιρετικό)</label>
-      <input type="time" value={arrivalTime} onChange={e => setArrivalTime(e.target.value)} style={input} />
+      <Time24Input value={arrivalTime || '10:00'} onChange={setArrivalTime} />
 
       <label style={label}>Όνομα πελάτη</label>
       <input value={customerName} onChange={e => setCustomerName(e.target.value)} placeholder="π.χ. Κος Αντωνίου" style={input} />
@@ -796,6 +872,47 @@ function EndShiftScreen({ driver, shift, onBack, onSubmit }) {
   );
 }
 
+function MyScheduleScreen({ state, driverId, onBack }) {
+  const [weekStart, setWeekStart] = useState(mondayOf(isoDateStr(new Date())));
+  const days = [0, 1, 2, 3, 4, 5, 6];
+
+  return (
+    <Screen title="Πρόγραμμά μου" subtitle={`${weekStart} — ${addDaysIso(weekStart, 6)}`} onBack={onBack}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16 }}>
+        <button onClick={() => setWeekStart(addDaysIso(weekStart, -7))} style={smallBtn(MUTE)}>‹ Προηγ. εβδομάδα</button>
+        <button onClick={() => setWeekStart(addDaysIso(weekStart, 7))} style={smallBtn(MUTE)}>Επόμ. εβδομάδα ›</button>
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        {days.map(day => {
+          const entry = state.schedule.find(e => e.weekStart === weekStart && e.driverId === driverId && e.day === day);
+          const dateStr = addDaysIso(weekStart, day);
+          const isToday = dateStr === isoDateStr(new Date());
+          return (
+            <div key={day} style={{ background: CARD, borderRadius: 12, padding: 14, border: `1px solid ${isToday ? ACCENT : BORDER}` }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div>
+                  <div style={{ color: TEXT, fontSize: 14, fontWeight: 700 }}>{DAY_LABELS_FULL[day]}</div>
+                  <div style={{ color: MUTE, fontSize: 12 }}>{dateStr}</div>
+                </div>
+                {!entry ? (
+                  <span style={{ color: MUTE, fontSize: 13 }}>—</span>
+                ) : entry.type === 'rest' ? (
+                  <span style={{ background: 'rgba(139,146,160,0.15)', color: MUTE, padding: '4px 10px', borderRadius: 6, fontSize: 12, fontWeight: 700 }}>Ρεπό</span>
+                ) : (
+                  <div style={{ textAlign: 'right' }}>
+                    <div style={{ color: ACCENT, fontSize: 13, fontWeight: 700 }}>{classifyShift(entry.startTime)} · {entry.startTime}–{entry.endTime}</div>
+                    <div style={{ color: MUTE, fontSize: 12 }}>{entry.car}</div>
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </Screen>
+  );
+}
+
 function HistoryScreen({ state, driverId, onBack }) {
   const shifts = state.shifts.filter(s => s.driverId === driverId).slice().reverse();
   return (
@@ -898,6 +1015,7 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
           { id: 'calendar', label: 'Ημερολόγιο' },
           { id: 'appointments', label: 'Ραντεβού' },
           { id: 'shifts', label: 'Βάρδιες' },
+          { id: 'schedule', label: 'Πρόγραμμα' },
           { id: 'bookings', label: 'Προμισθώσεις' },
           { id: 'reports', label: 'Αναφορές' },
           { id: 'fleet', label: 'Στόλος & Οδηγοί' },
@@ -916,6 +1034,7 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
         {tab === 'calendar' && <CalendarTab state={state} persist={persist} />}
         {tab === 'appointments' && <AppointmentsHistoryTab state={state} persist={persist} />}
         {tab === 'shifts' && <AllShiftsTab state={state} persist={persist} onLock={lockShift} onUnlock={unlockShift} />}
+        {tab === 'schedule' && <ScheduleTab state={state} persist={persist} />}
         {tab === 'bookings' && <BookingsTab state={state} persist={persist} />}
         {tab === 'reports' && <ReportsTab state={state} />}
         {tab === 'fleet' && <FleetTab state={state} persist={persist} />}
@@ -1124,6 +1243,189 @@ function MaintenanceTab({ state, persist }) {
             </div>
           );
         })}
+      </div>
+    </div>
+  );
+}
+
+// ---------- Εβδομαδιαίο πρόγραμμα οδηγών ----------
+function ScheduleTab({ state, persist }) {
+  const [weekStart, setWeekStart] = useState(mondayOf(isoDateStr(new Date())));
+  const [editing, setEditing] = useState(null); // { driverId, day, entry|null }
+
+  const getEntry = (driverId, day) =>
+    state.schedule.find(e => e.weekStart === weekStart && e.driverId === driverId && e.day === day);
+
+  const weekEndLabel = addDaysIso(weekStart, 6);
+
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap', gap: 10 }}>
+        <div style={{ color: TEXT, fontSize: 15, fontWeight: 700 }}>Πρόγραμμα οδηγών</div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <button onClick={() => setWeekStart(addDaysIso(weekStart, -7))} style={smallBtn(MUTE)}>‹ Προηγ.</button>
+          <span style={{ color: MUTE, fontSize: 13 }}>{weekStart} — {weekEndLabel}</span>
+          <button onClick={() => setWeekStart(addDaysIso(weekStart, 7))} style={smallBtn(MUTE)}>Επόμ. ›</button>
+          <button onClick={() => setWeekStart(mondayOf(isoDateStr(new Date())))} style={smallBtn(ACCENT)}>Σήμερα</button>
+        </div>
+      </div>
+
+      <div style={{ overflowX: 'auto', marginBottom: 24 }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+          <thead>
+            <tr>
+              <th style={{ ...td, color: MUTE, fontWeight: 500, textAlign: 'left', minWidth: 120 }}>Οδηγός</th>
+              {[0, 1, 2, 3, 4, 5, 6].map(day => (
+                <th key={day} style={{ ...td, color: MUTE, fontWeight: 500, minWidth: 130 }}>
+                  {DAY_LABELS_SHORT[day]}<br />
+                  <span style={{ fontSize: 11 }}>{addDaysIso(weekStart, day).slice(5)}</span>
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {state.drivers.map(driver => (
+              <tr key={driver.id} style={{ borderTop: `1px solid ${CARD}` }}>
+                <td style={{ ...td, fontWeight: 600 }}>{driver.name}</td>
+                {[0, 1, 2, 3, 4, 5, 6].map(day => {
+                  const entry = getEntry(driver.id, day);
+                  const isRest = entry?.type === 'rest';
+                  const isShift = entry?.type === 'shift';
+                  return (
+                    <td key={day} style={{ ...td, padding: 4 }}>
+                      <button
+                        onClick={() => setEditing({ driverId: driver.id, day, entry: entry || null })}
+                        style={{
+                          width: '100%', textAlign: 'left', borderRadius: 8, padding: '8px 10px', cursor: 'pointer',
+                          background: isRest ? 'rgba(139,146,160,0.12)' : isShift ? 'rgba(245,185,66,0.12)' : 'none',
+                          border: `1px dashed ${isRest || isShift ? 'transparent' : BORDER}`,
+                          color: isRest ? MUTE : isShift ? TEXT : MUTE,
+                        }}
+                      >
+                        {isRest ? (
+                          <span style={{ fontWeight: 700 }}>Ρεπό</span>
+                        ) : isShift ? (
+                          <>
+                            <div style={{ fontWeight: 700 }}>{classifyShift(entry.startTime)}</div>
+                            <div>{entry.startTime}–{entry.endTime}</div>
+                            <div style={{ color: MUTE }}>{entry.car}</div>
+                          </>
+                        ) : (
+                          <span>+ Προσθήκη</span>
+                        )}
+                      </button>
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Κάλυψη οχημάτων</div>
+      <div style={{ color: MUTE, fontSize: 12, marginBottom: 12 }}>Ώρες που κανένα ραντεβού δεν καλύπτει το κάθε όχημα αυτή την εβδομάδα — υπολογίζεται αυτόματα από το πρόγραμμα.</div>
+      <div style={{ overflowX: 'auto' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+          <thead>
+            <tr>
+              <th style={{ ...td, color: MUTE, fontWeight: 500, textAlign: 'left', minWidth: 90 }}>Όχημα</th>
+              {[0, 1, 2, 3, 4, 5, 6].map(day => (
+                <th key={day} style={{ ...td, color: MUTE, fontWeight: 500, minWidth: 130 }}>{DAY_LABELS_SHORT[day]}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {state.cars.map(c => (
+              <tr key={c.id} style={{ borderTop: `1px solid ${CARD}` }}>
+                <td style={{ ...td, fontWeight: 600 }}>{c.id}</td>
+                {[0, 1, 2, 3, 4, 5, 6].map(day => {
+                  const gaps = computeCarGaps(state.schedule, weekStart, day, c.id);
+                  const fullyEmpty = gaps.length === 1 && gaps[0] === '00:00–24:00';
+                  return (
+                    <td key={day} style={{ ...td, color: fullyEmpty ? MUTE : gaps.length ? RED : GREEN, fontSize: 11 }}>
+                      {gaps.length === 0 ? '✓ Πλήρης' : fullyEmpty ? '— Κενό' : gaps.join(', ')}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {editing && (
+        <EditScheduleEntryModal
+          state={state} persist={persist} weekStart={weekStart}
+          driverId={editing.driverId} day={editing.day} entry={editing.entry}
+          onClose={() => setEditing(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function EditScheduleEntryModal({ state, persist, weekStart, driverId, day, entry, onClose }) {
+  const driver = state.drivers.find(d => d.id === driverId);
+  const [mode, setMode] = useState(entry ? entry.type : 'shift'); // 'shift' | 'rest'
+  const [startTime, setStartTime] = useState(entry?.startTime || '06:00');
+  const [endTime, setEndTime] = useState(entry?.endTime || '18:00');
+  const [car, setCar] = useState(entry?.car || state.cars[0]?.id || '');
+
+  const save = async () => {
+    const base = { id: entry?.id || ('sch_' + Date.now() + '_' + driverId + '_' + day), weekStart, driverId, day };
+    const newEntry = mode === 'rest'
+      ? { ...base, type: 'rest', startTime: null, endTime: null, car: null }
+      : { ...base, type: 'shift', startTime, endTime, car };
+    const next = entry
+      ? state.schedule.map(e => e.id === entry.id ? newEntry : e)
+      : [...state.schedule, newEntry];
+    await persist({ ...state, schedule: next });
+    onClose();
+  };
+
+  const clear = async () => {
+    if (!entry) return onClose();
+    await persist({ ...state, schedule: state.schedule.filter(e => e.id !== entry.id) });
+    onClose();
+  };
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'flex-end', justifyContent: 'center', zIndex: 50 }}>
+      <div style={{ background: BG, border: `1px solid ${BORDER}`, borderRadius: '20px 20px 0 0', padding: 24, width: '100%', maxWidth: 480, maxHeight: '90vh', overflowY: 'auto' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+          <div style={{ color: TEXT, fontSize: 17, fontWeight: 700 }}>{driver?.name}</div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer' }}><X size={20} /></button>
+        </div>
+        <div style={{ color: MUTE, fontSize: 13, marginBottom: 20 }}>{DAY_LABELS_FULL[day]} · {addDaysIso(weekStart, day)}</div>
+
+        <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+          <button onClick={() => setMode('shift')} style={{ flex: 1, padding: 10, borderRadius: 8, border: `1px solid ${mode === 'shift' ? ACCENT : BORDER}`, background: mode === 'shift' ? 'rgba(245,185,66,0.12)' : 'none', color: mode === 'shift' ? ACCENT : MUTE, fontWeight: 700, cursor: 'pointer' }}>Βάρδια</button>
+          <button onClick={() => setMode('rest')} style={{ flex: 1, padding: 10, borderRadius: 8, border: `1px solid ${mode === 'rest' ? MUTE : BORDER}`, background: mode === 'rest' ? 'rgba(139,146,160,0.15)' : 'none', color: mode === 'rest' ? TEXT : MUTE, fontWeight: 700, cursor: 'pointer' }}>Ρεπό</button>
+        </div>
+
+        {mode === 'shift' && (
+          <>
+            <label style={label}>Ώρα έναρξης</label>
+            <Time24Input value={startTime} onChange={setStartTime} />
+            <label style={label}>Ώρα λήξης</label>
+            <Time24Input value={endTime} onChange={setEndTime} />
+            <div style={{ color: MUTE, fontSize: 12, marginTop: -10, marginBottom: 16 }}>
+              Αναγνωρίζεται αυτόματα ως: <span style={{ color: ACCENT, fontWeight: 700 }}>{classifyShift(startTime)}</span>
+            </div>
+            <label style={label}>Όχημα</label>
+            <select value={car} onChange={e => setCar(e.target.value)} style={input}>
+              {state.cars.map(c => <option key={c.id} value={c.id}>{c.id}</option>)}
+            </select>
+          </>
+        )}
+
+        <button onClick={save} style={{ ...btnPrimary, justifyContent: 'center' }}>Αποθήκευση</button>
+        {entry && (
+          <button onClick={clear} style={{ width: '100%', background: 'none', border: `1px solid ${RED}`, color: RED, borderRadius: 12, padding: 12, fontSize: 14, fontWeight: 700, cursor: 'pointer', marginTop: 10 }}>
+            Διαγραφή καταχώρισης
+          </button>
+        )}
       </div>
     </div>
   );
@@ -1351,7 +1653,7 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
           </div>
           <div style={{ flex: 1 }}>
             <label style={label}>Ώρα</label>
-            <input type="time" value={time} onChange={e => setTime(e.target.value)} style={input} />
+            <Time24Input value={time} onChange={setTime} />
           </div>
           <div style={{ width: 100 }}>
             <label style={label}>Λεπτά</label>
