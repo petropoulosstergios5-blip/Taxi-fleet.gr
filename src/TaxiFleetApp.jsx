@@ -991,17 +991,19 @@ function EndShiftScreen({ state, driver, shift, onBack, onSubmit }) {
   };
 
   const kmValid = endKm && Number(endKm) >= shift.startKm;
-  const totalRevenue = (Number(cash) || 0) + (Number(card) || 0) + (Number(app) || 0);
-  const netResult = totalRevenue - (Number(expenses) || 0) - (Number(fuel) || 0);
   const canSubmit = kmValid && cash !== '' && card !== '' && app !== '' && photoStatus !== 'uploading';
   const shiftBookings = state.bookings.filter(b => b.shiftId === shift.id);
   const byMethod = (method) => shiftBookings.filter(b => (b.paymentMethod || 'cash') === method);
   const sumOf = (list) => list.reduce((sum, b) => sum + (Number(b.price) || 0), 0);
   const cashBookings = byMethod('cash'), cardBookings = byMethod('card'), appBookings = byMethod('app');
   const cashFromBookings = sumOf(cashBookings), cardFromBookings = sumOf(cardBookings), appFromBookings = sumOf(appBookings);
-  const bookingsTotal = cashFromBookings + cardFromBookings + appFromBookings;
-  const diff = totalRevenue - bookingsTotal;
-  const hasEnteredAmounts = cash !== '' || card !== '' || app !== '';
+  // What the driver types is ONLY the extra amount (e.g. street hails) — the app adds
+  // the logged bookings for that category automatically on top, for the real final total.
+  const finalCash = (Number(cash) || 0) + cashFromBookings;
+  const finalCard = (Number(card) || 0) + cardFromBookings;
+  const finalApp = (Number(app) || 0) + appFromBookings;
+  const totalRevenue = finalCash + finalCard + finalApp;
+  const netResult = totalRevenue - (Number(expenses) || 0) - (Number(fuel) || 0);
 
   return (
     <Screen title="Κλείσιμο Βάρδιας" subtitle={`${carLabelById(state, shift.car)} · ξεκίνησε στα ${shift.startKm} χλμ`} onBack={onBack}>
@@ -1011,48 +1013,36 @@ function EndShiftScreen({ state, driver, shift, onBack, onSubmit }) {
 
       <GPSButton status={gpsStatus} onClick={grabGPS} gps={gps} label="Καταγραφή θέσης τέλους (GPS)" />
 
-      <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
-        <div style={{ flex: 1 }}>
-          <label style={label}><Banknote size={13} style={{ verticalAlign: 'middle', marginRight: 4 }} />Μετρητά</label>
-          <input type="number" value={cash} onChange={e => setCash(e.target.value)} style={{ ...input, marginBottom: 4 }} />
-          {cashBookings.length > 0 && (
-            <div style={{ color: ACCENT, fontSize: 11 }}>{cashBookings.length} διαδρ.: +{fmtEUR(cashFromBookings)}</div>
-          )}
-        </div>
-        <div style={{ flex: 1 }}>
-          <label style={label}><CreditCard size={13} style={{ verticalAlign: 'middle', marginRight: 4 }} />Κάρτες</label>
-          <input type="number" value={card} onChange={e => setCard(e.target.value)} style={{ ...input, marginBottom: 4 }} />
-          {cardBookings.length > 0 && (
-            <div style={{ color: ACCENT, fontSize: 11 }}>{cardBookings.length} διαδρ.: +{fmtEUR(cardFromBookings)}</div>
-          )}
-        </div>
-        <div style={{ flex: 1 }}>
-          <label style={label}><Smartphone size={13} style={{ verticalAlign: 'middle', marginRight: 4 }} />App</label>
-          <input type="number" value={app} onChange={e => setApp(e.target.value)} style={{ ...input, marginBottom: 4 }} />
-          {appBookings.length > 0 && (
-            <div style={{ color: ACCENT, fontSize: 11 }}>{appBookings.length} διαδρ.: +{fmtEUR(appFromBookings)}</div>
-          )}
-        </div>
+      <div style={{ color: MUTE, fontSize: 12, marginBottom: 10 }}>
+        Γράψε μόνο ό,τι εισέπραξες <b style={{ color: TEXT }}>εκτός</b> από τις διαδρομές που ήδη κατέγραψες — αυτές προστίθενται αυτόματα.
       </div>
 
-      {bookingsTotal > 0 && (
-        <div style={{
-          background: !hasEnteredAmounts ? CARD : Math.abs(diff) < 0.01 ? 'rgba(74,155,110,0.12)' : Math.abs(diff) <= 5 ? 'rgba(245,185,66,0.12)' : 'rgba(193,84,60,0.12)',
-          border: `1px solid ${!hasEnteredAmounts ? BORDER : Math.abs(diff) < 0.01 ? GREEN : Math.abs(diff) <= 5 ? ACCENT : RED}`,
-          borderRadius: 10, padding: 12, marginBottom: 16, fontSize: 12,
-        }}>
-          <div style={{ color: MUTE, marginBottom: 4 }}>
-            Οι παραπάνω υπενθυμίσεις (κίτρινο) είναι τα ποσά από τις διαδρομές που κατέγραψες μέσα στη βάρδια — <b style={{ color: TEXT }}>πρόσθεσέ τα</b> στο κάθε πεδίο μαζί με ό,τι άλλο εισέπραξες (π.χ. διαδρομές πιάτσας).
+      <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
+        {[
+          { key: 'cash', label: 'Μετρητά', Icon: Banknote, value: cash, setValue: setCash, bookings: cashBookings, fromBookings: cashFromBookings, final: finalCash },
+          { key: 'card', label: 'Κάρτες', Icon: CreditCard, value: card, setValue: setCard, bookings: cardBookings, fromBookings: cardFromBookings, final: finalCard },
+          { key: 'app', label: 'App', Icon: Smartphone, value: app, setValue: setApp, bookings: appBookings, fromBookings: appFromBookings, final: finalApp },
+        ].map(col => (
+          <div key={col.key} style={{ flex: 1 }}>
+            <label style={label}><col.Icon size={13} style={{ verticalAlign: 'middle', marginRight: 4 }} />{col.label}</label>
+            <input type="number" value={col.value} onChange={e => col.setValue(e.target.value)} placeholder="0" style={{ ...input, marginBottom: 4 }} />
+            {col.bookings.length > 0 && (
+              <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 8, padding: 8, fontSize: 11 }}>
+                {col.bookings.map(b => (
+                  <div key={b.id} style={{ color: MUTE, display: 'flex', justifyContent: 'space-between' }}>
+                    <span>{b.customerName}</span>
+                    <span style={{ color: ACCENT }}>+{fmtEUR(b.price)}</span>
+                  </div>
+                ))}
+                <div style={{ borderTop: `1px solid ${BORDER}`, marginTop: 4, paddingTop: 4, display: 'flex', justifyContent: 'space-between', fontWeight: 700 }}>
+                  <span style={{ color: TEXT }}>Σύνολο</span>
+                  <span style={{ color: GREEN }}>{fmtEUR(col.final)}</span>
+                </div>
+              </div>
+            )}
           </div>
-          {hasEnteredAmounts && (
-            <div style={{ color: Math.abs(diff) < 0.01 ? GREEN : Math.abs(diff) <= 5 ? ACCENT : RED, marginTop: 6, fontWeight: 600 }}>
-              {Math.abs(diff) < 0.01
-                ? '✓ Το σύνολο ταιριάζει ακριβώς με τις καταγεγραμμένες διαδρομές'
-                : `Το σύνολο που έγραψες είναι κατά ${diff > 0 ? '+' : ''}${fmtEUR(diff)} διαφορετικό από το άθροισμα των διαδρομών — φυσιολογικό αν υπήρξαν κι άλλες διαδρομές εκτός καταγραφής`}
-            </div>
-          )}
-        </div>
-      )}
+        ))}
+      </div>
 
       <label style={{ ...label, marginTop: 16 }}>Έξοδα (€)</label>
       <input type="number" value={expenses} onChange={e => setExpenses(e.target.value)} placeholder="π.χ. 5" style={input} />
@@ -1085,7 +1075,7 @@ function EndShiftScreen({ state, driver, shift, onBack, onSubmit }) {
       </div>
 
       <button
-        onClick={() => canSubmit && onSubmit({ endKm, cash, card, app, expenses, fuel, fuelReceiptPhoto: photoUrl, gps })}
+        onClick={() => canSubmit && onSubmit({ endKm, cash: finalCash, card: finalCard, app: finalApp, expenses, fuel, fuelReceiptPhoto: photoUrl, gps })}
         disabled={!canSubmit}
         style={{ ...btnPrimary, background: canSubmit ? RED : '#3A4150', color: '#fff', justifyContent: 'center', cursor: canSubmit ? 'pointer' : 'not-allowed' }}
       >
