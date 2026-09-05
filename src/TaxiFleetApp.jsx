@@ -3275,6 +3275,7 @@ function computeReportStats(state, shifts) {
 
 function exportShiftsCSV(shifts, state, filename) {
   const header = ['Ημερομηνία', 'Οδηγός', 'Όχημα', 'Χλμ', 'Μετρητά', 'Κάρτες', 'App', 'Έξοδα', 'Πετρέλαιο', 'Τζίρος', 'Καθαρό', 'Διαδρομές'];
+  const num = (n) => (Number(n) || 0).toFixed(2).replace('.', ','); // Greek/EU Excel expects comma decimals
   const rows = shifts.map(s => {
     const driver = state.drivers.find(d => d.id === s.driverId);
     const revenue = (s.cash || 0) + (s.card || 0) + (s.app || 0);
@@ -3283,14 +3284,14 @@ function exportShiftsCSV(shifts, state, filename) {
     return [
       s.date, driver?.name || '', carLabelById(state, s.car),
       s.endKm ? s.endKm - s.startKm : '',
-      (s.cash || 0).toFixed(2), (s.card || 0).toFixed(2), (s.app || 0).toFixed(2),
-      (s.expenses || 0).toFixed(2), (s.fuel || 0).toFixed(2),
-      revenue.toFixed(2), net.toFixed(2), bookingsCount,
+      num(s.cash), num(s.card), num(s.app),
+      num(s.expenses), num(s.fuel),
+      num(revenue), num(net), bookingsCount,
     ];
   });
   const escapeCsv = (v) => {
     const str = String(v);
-    return /[",\n;]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
+    return /["\n;]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
   };
   const csv = '\uFEFF' + [header, ...rows].map(r => r.map(escapeCsv).join(';')).join('\r\n');
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
