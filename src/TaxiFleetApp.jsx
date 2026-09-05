@@ -38,6 +38,8 @@ function hydrateState(raw) {
     appointments: raw.appointments || initialState.appointments,
     schedule: raw.schedule || initialState.schedule,
     reportsResetAt: raw.reportsResetAt !== undefined ? raw.reportsResetAt : initialState.reportsResetAt,
+    adminUsername: raw.adminUsername || initialState.adminUsername,
+    adminPassword: raw.adminPassword || initialState.adminPassword,
   };
 }
 
@@ -82,6 +84,8 @@ const initialState = {
                      //   createdAt, assignedAt, acceptedAt, arrivedAt, completedAt}
   schedule: [], // weekly roster entries: {id, weekStart (Monday, ISO), driverId, day (0=Mon..6=Sun), slot: 'morning'|'night'|'rest', car}
   reportsResetAt: null, // ISO timestamp (date+time) — "Γενικό σύνολο" in Reports only counts shifts closed after this moment. Doesn't delete anything; monthly view always sees full history.
+  adminUsername: 'admin',
+  adminPassword: 'admin',
 };
 
 const fontStack = { fontFamily: 'Inter, system-ui, sans-serif' };
@@ -346,14 +350,14 @@ export default function TaxiFleetApp() {
   }
 
   if (!session) {
-    return <LoginScreen drivers={state.drivers} onLogin={setSession} />;
+    return <LoginScreen drivers={state.drivers} adminUsername={state.adminUsername} adminPassword={state.adminPassword} onLogin={setSession} />;
   }
 
   if (session.role === 'driver') {
     const driverExists = state.drivers.some(d => d.id === session.driverId);
     if (!driverExists) {
       setSession(null);
-      return <LoginScreen drivers={state.drivers} onLogin={setSession} />;
+      return <LoginScreen drivers={state.drivers} adminUsername={state.adminUsername} adminPassword={state.adminPassword} onLogin={setSession} />;
     }
     return <DriverApp state={state} persist={persist} driverId={session.driverId} onLogout={() => setSession(null)} cloudStatus={cloudStatus} />;
   }
@@ -394,7 +398,7 @@ function CloudBadge({ status }) {
 }
 
 // ================= LOGIN =================
-function LoginScreen({ drivers, onLogin }) {
+function LoginScreen({ drivers, adminUsername, adminPassword, onLogin }) {
   const [mode, setMode] = useState(null); // 'driver' | 'admin'
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -410,7 +414,7 @@ function LoginScreen({ drivers, onLogin }) {
   };
 
   const submitAdmin = () => {
-    if (username.trim().toLowerCase() === 'admin' && password === 'admin') {
+    if (username.trim().toLowerCase() === adminUsername.trim().toLowerCase() && password === adminPassword) {
       onLogin({ role: 'admin' });
     } else {
       setError('Λάθος στοιχεία διαχειριστή');
@@ -454,9 +458,6 @@ function LoginScreen({ drivers, onLogin }) {
             </button>
             {mode === 'driver' && (
               <div style={{ color: MUTE, fontSize: 11, marginTop: 14, textAlign: 'center' }}>Demo: giorgos / nikos / maria — κωδικός 1111</div>
-            )}
-            {mode === 'admin' && (
-              <div style={{ color: MUTE, fontSize: 11, marginTop: 14, textAlign: 'center' }}>Demo: admin / admin</div>
             )}
           </div>
         )}
@@ -1643,6 +1644,7 @@ function FleetTab({ state, persist }) {
   const [editingDriver, setEditingDriver] = useState(null); // driver object or 'new'
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
   const [editingCar, setEditingCar] = useState(null); // car object being edited
+  const [editingAdminAccount, setEditingAdminAccount] = useState(false);
 
   const activeShiftForCar = (carId) => state.shifts.find(s => s.car === carId && s.status === 'active');
 
@@ -1729,6 +1731,16 @@ function FleetTab({ state, persist }) {
       </div>
       {editingCar && <EditCarModal state={state} persist={persist} car={editingCar} onClose={() => setEditingCar(null)} />}
 
+      <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Λογαριασμός διαχειριστή</div>
+      <div style={{ background: CARD, borderRadius: 10, padding: '12px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', border: `1px solid ${BORDER}`, marginBottom: 24 }}>
+        <div>
+          <div style={{ color: TEXT, fontSize: 14, fontWeight: 600 }}>{state.adminUsername}</div>
+          <div style={{ color: MUTE, fontSize: 12 }}>Στοιχεία σύνδεσης διαχειριστή</div>
+        </div>
+        <button onClick={() => setEditingAdminAccount(true)} style={smallBtn(ACCENT)}>Επεξεργασία</button>
+      </div>
+      {editingAdminAccount && <AdminAccountModal state={state} persist={persist} onClose={() => setEditingAdminAccount(false)} />}
+
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
         <div style={{ color: TEXT, fontSize: 15, fontWeight: 700 }}>Οδηγοί</div>
         <button onClick={() => setEditingDriver('new')} style={{ background: 'none', border: `1px solid ${BORDER}`, color: TEXT, borderRadius: 8, padding: '7px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -1760,6 +1772,52 @@ function FleetTab({ state, persist }) {
           onSave={saveDriver}
         />
       )}
+    </div>
+  );
+}
+
+function AdminAccountModal({ state, persist, onClose }) {
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newUsername, setNewUsername] = useState(state.adminUsername);
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [error, setError] = useState('');
+
+  const submit = async () => {
+    if (currentPassword !== state.adminPassword) { setError('Λάθος τρέχων κωδικός.'); return; }
+    if (!newUsername.trim()) { setError('Το όνομα χρήστη δεν μπορεί να είναι κενό.'); return; }
+    if (newPassword && newPassword !== confirmPassword) { setError('Οι νέοι κωδικοί δεν ταιριάζουν.'); return; }
+    await persist({
+      ...state,
+      adminUsername: newUsername.trim(),
+      adminPassword: newPassword || state.adminPassword,
+    });
+    onClose();
+  };
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: 20 }}>
+      <div style={{ background: BG, border: `1px solid ${BORDER}`, borderRadius: 16, padding: 24, width: '100%', maxWidth: 400 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+          <div style={{ color: TEXT, fontSize: 17, fontWeight: 700 }}>Στοιχεία σύνδεσης διαχειριστή</div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer' }}><X size={20} /></button>
+        </div>
+
+        <label style={label}>Τρέχων κωδικός (για επιβεβαίωση)</label>
+        <input type="password" value={currentPassword} onChange={e => setCurrentPassword(e.target.value)} style={input} />
+
+        <label style={label}>Νέο όνομα χρήστη</label>
+        <input value={newUsername} onChange={e => setNewUsername(e.target.value)} style={input} />
+
+        <label style={label}>Νέος κωδικός (άφησέ το κενό για να μείνει ο ίδιος)</label>
+        <input type="password" value={newPassword} onChange={e => setNewPassword(e.target.value)} style={input} />
+
+        <label style={label}>Επιβεβαίωση νέου κωδικού</label>
+        <input type="password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} style={input} />
+
+        {error && <div style={{ color: RED, fontSize: 13, marginBottom: 12 }}>{error}</div>}
+        <button onClick={submit} style={{ ...btnPrimary, justifyContent: 'center' }}>Αποθήκευση</button>
+      </div>
     </div>
   );
 }
