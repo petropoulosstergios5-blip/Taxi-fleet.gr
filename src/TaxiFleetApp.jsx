@@ -154,6 +154,16 @@ function carLabelById(state, carId) {
   return carLabel(state.cars.find(c => c.id === carId));
 }
 
+// A driver's cash float ("ταμείο") carries over automatically from their last closed
+// shift's ending float — not the general turnover, just the physical cash they're
+// holding. New drivers (or ones with no prior closed shift) start at €0.
+function getDriverLastTameio(state, driverId) {
+  const closed = state.shifts
+    .filter(s => s.driverId === driverId && s.status !== 'active' && s.endTime)
+    .sort((a, b) => new Date(b.endTime) - new Date(a.endTime));
+  return closed.length > 0 && closed[0].endTameio != null ? closed[0].endTameio : 0;
+}
+
 function getCarCurrentKm(state, carId) {
   const car = state.cars.find(c => c.id === carId);
   let max = car?.baseKm || 0;
@@ -580,9 +590,9 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
       endTime: null,
       startKm: getCarCurrentKm(state, payload.car),
       endKm: null,
-      startCash: Number(payload.startCash) || 0,
+      startCash: getDriverLastTameio(state, driverId),
       cash: null, card: null, app: null,
-      expenses: null, fuel: null, fuelReceiptPhoto: null,
+      expenses: null, fuel: null, fuelReceiptPhoto: null, endTameio: null,
       gpsStart: payload.gps || null, gpsEnd: null,
       status: 'active',
       notes: '',
@@ -598,17 +608,26 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
   };
 
   const closeShift = async (payload) => {
+    const s0 = state.shifts.find(s => s.id === activeShift.id);
+    const cashAmount = Number(payload.cash) || 0;
+    const expensesAmount = Number(payload.expenses) || 0;
+    const fuelAmount = Number(payload.fuel) || 0;
+    // "Ταμείο" is physical cash only — the driver's starting float, plus cash collected
+    // this shift, minus anything paid out in cash (fuel/expenses). Card and app revenue
+    // never touch it.
+    const endTameio = (s0?.startCash || 0) + cashAmount - expensesAmount - fuelAmount;
     const next = {
       ...state,
       shifts: state.shifts.map(s => s.id === activeShift.id ? {
         ...s,
         endTime: new Date().toISOString(),
         endKm: Number(payload.endKm),
-        cash: Number(payload.cash) || 0,
+        cash: cashAmount,
         card: Number(payload.card) || 0,
         app: Number(payload.app) || 0,
-        expenses: Number(payload.expenses) || 0,
-        fuel: Number(payload.fuel) || 0,
+        expenses: expensesAmount,
+        fuel: fuelAmount,
+        endTameio,
         fuelReceiptPhoto: payload.fuelReceiptPhoto || null,
         gpsEnd: payload.gps || null,
         status: 'closed', // closed = waiting for admin lock/approval, driver can no longer edit
@@ -789,7 +808,6 @@ function StartShiftScreen({ state, driver, cars, activeShifts, onBack, onSubmit 
   const [selectedCar, setSelectedCar] = useState(
     availableCars.some(c => c.id === driver.car) ? driver.car : (availableCars[0]?.id || '')
   );
-  const [startCash, setStartCash] = useState('');
   const [gps, setGps] = useState(null);
   const [gpsStatus, setGpsStatus] = useState('idle');
 
@@ -801,7 +819,8 @@ function StartShiftScreen({ state, driver, cars, activeShifts, onBack, onSubmit 
   };
 
   const startKmPreview = selectedCar ? getCarCurrentKm(state, selectedCar) : 0;
-  const canSubmit = selectedCar && startCash !== '';
+  const startTameioPreview = getDriverLastTameio(state, driver.id);
+  const canSubmit = !!selectedCar;
 
   return (
     <Screen title="Έναρξη Βάρδιας" subtitle={selectedCar ? carLabelById(state, selectedCar) : 'Επιλογή οχήματος'} onBack={onBack}>
@@ -820,14 +839,12 @@ function StartShiftScreen({ state, driver, cars, activeShifts, onBack, onSubmit 
       <Row label="Ημερομηνία" value={todayStr()} />
       <Row label="Ώρα έναρξης" value={new Date().toLocaleTimeString('el-GR', { hour: '2-digit', minute: '2-digit', hour12: false })} />
       <Row label="Χιλιόμετρα έναρξης" value={`${startKmPreview.toLocaleString('el-GR')} χλμ (αυτόματα, από το όχημα)`} />
-
-      <label style={label}>Αρχικό ταμείο (€)</label>
-      <input type="number" value={startCash} onChange={e => setStartCash(e.target.value)} placeholder="π.χ. 50" style={input} />
+      <Row label="Ταμείο έναρξης" value={`${fmtEUR(startTameioPreview)} (αυτόματα, από την προηγούμενη βάρδια σου)`} />
 
       <GPSButton status={gpsStatus} onClick={grabGPS} gps={gps} label="Καταγραφή θέσης έναρξης (GPS)" />
 
       <button
-        onClick={() => canSubmit && onSubmit({ car: selectedCar, startCash, gps })}
+        onClick={() => canSubmit && onSubmit({ car: selectedCar, gps })}
         disabled={!canSubmit}
         style={{ ...btnPrimary, justifyContent: 'center', marginTop: 12, opacity: canSubmit ? 1 : 0.5, cursor: canSubmit ? 'pointer' : 'not-allowed' }}
       >
@@ -1129,6 +1146,7 @@ function MyScheduleScreen({ state, driverId, onBack }) {
 
 function HistoryScreen({ state, driverId, onBack }) {
   const shifts = state.shifts.filter(s => s.driverId === driverId).slice().reverse();
+  const [selectedShift, setSelectedShift] = useState(null);
   return (
     <Screen title="Ιστορικό Βαρδιών" onBack={onBack}>
       {shifts.length === 0 && <div style={{ color: MUTE, fontSize: 13 }}>Καμία βάρδια ακόμα</div>}
@@ -1137,7 +1155,7 @@ function HistoryScreen({ state, driverId, onBack }) {
           const revenue = (s.cash || 0) + (s.card || 0) + (s.app || 0);
           const bookingsCount = state.bookings.filter(b => b.shiftId === s.id).length;
           return (
-            <div key={s.id} style={{ background: CARD, borderRadius: 12, padding: 14, border: `1px solid ${BORDER}` }}>
+            <button key={s.id} onClick={() => setSelectedShift(s)} style={{ textAlign: 'left', background: CARD, borderRadius: 12, padding: 14, border: `1px solid ${BORDER}`, cursor: 'pointer', font: 'inherit', color: 'inherit' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
                 <div style={{ color: TEXT, fontSize: 14, fontWeight: 700 }}>{s.date}</div>
                 <StatusBadge status={s.status} />
@@ -1151,11 +1169,72 @@ function HistoryScreen({ state, driverId, onBack }) {
                   <span style={{ color: GREEN, fontSize: 14, fontWeight: 700 }}>{fmtEUR(revenue)}</span>
                 </div>
               )}
-            </div>
+            </button>
           );
         })}
       </div>
+      {selectedShift && <ShiftStatsModal state={state} shift={selectedShift} onClose={() => setSelectedShift(null)} />}
     </Screen>
+  );
+}
+
+function ShiftStatsModal({ state, shift: s, onClose }) {
+  const bookings = state.bookings.filter(b => b.shiftId === s.id);
+  const revenue = (s.cash || 0) + (s.card || 0) + (s.app || 0);
+  const net = revenue - (s.expenses || 0) - (s.fuel || 0);
+  const km = s.endKm ? s.endKm - s.startKm : null;
+  const durationMs = s.endTime ? new Date(s.endTime) - new Date(s.startTime) : null;
+  const durationLabel = durationMs != null ? `${Math.floor(durationMs / 3600000)}ω ${Math.round((durationMs % 3600000) / 60000)}λ` : '—';
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'flex-end', justifyContent: 'center', zIndex: 50 }}>
+      <div style={{ background: BG, border: `1px solid ${BORDER}`, borderRadius: '20px 20px 0 0', padding: 24, width: '100%', maxWidth: 480, maxHeight: '85vh', overflowY: 'auto' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+          <div style={{ color: TEXT, fontSize: 17, fontWeight: 700 }}>{s.date}</div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer' }}><X size={20} /></button>
+        </div>
+        <div style={{ color: MUTE, fontSize: 13, marginBottom: 20 }}>{carLabelById(state, s.car)} · <StatusBadge status={s.status} /></div>
+
+        <div style={{ display: 'flex', gap: 10, marginBottom: 16, flexWrap: 'wrap' }}>
+          <MiniStat label="Τζίρος" value={fmtEUR(revenue)} color={GREEN} />
+          <MiniStat label="Καθαρό" value={fmtEUR(net)} color={net >= 0 ? GREEN : RED} />
+          <MiniStat label="Χλμ" value={km != null ? km : '—'} />
+          <MiniStat label="Διάρκεια" value={durationLabel} />
+        </div>
+
+        <div style={{ background: CARD, borderRadius: 10, padding: 14, border: `1px solid ${BORDER}`, marginBottom: 16 }}>
+          <Row label="Μετρητά" value={fmtEUR(s.cash)} />
+          <Row label="Κάρτες" value={fmtEUR(s.card)} />
+          <Row label="App" value={fmtEUR(s.app)} />
+          <Row label="Έξοδα" value={fmtEUR(s.expenses)} />
+          <Row label="Πετρέλαιο" value={fmtEUR(s.fuel)} />
+          <Row label="Ταμείο έναρξης" value={fmtEUR(s.startCash)} />
+          {s.endTameio != null && <Row label="Ταμείο τέλους" value={fmtEUR(s.endTameio)} />}
+          {s.fuelReceiptPhoto && (
+            <div style={{ marginTop: 8 }}>
+              <a href={s.fuelReceiptPhoto} target="_blank" rel="noreferrer" style={{ color: ACCENT, fontSize: 13, textDecoration: 'none' }}>📷 Δες απόδειξη καυσίμου</a>
+            </div>
+          )}
+        </div>
+
+        {bookings.length > 0 && (
+          <>
+            <div style={{ color: TEXT, fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Προμισθώσεις ({bookings.length})</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {bookings.map(b => (
+                <div key={b.id} style={{ display: 'flex', justifyContent: 'space-between', background: CARD, borderRadius: 8, padding: 10, border: `1px solid ${BORDER}` }}>
+                  <div>
+                    <div style={{ color: TEXT, fontSize: 13 }}>{b.customerName} → {b.destination}</div>
+                    <div style={{ color: MUTE, fontSize: 11 }}>{{ cash: 'Μετρητά', card: 'Κάρτα', app: 'App' }[b.paymentMethod || 'cash']}</div>
+                  </div>
+                  <div style={{ color: GREEN, fontSize: 13, fontWeight: 700 }}>{fmtEUR(b.price)}</div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
   );
 }
 
