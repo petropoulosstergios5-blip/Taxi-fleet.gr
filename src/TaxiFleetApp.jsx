@@ -1463,6 +1463,7 @@ function Screen({ title, subtitle, onBack, children }) {
 // ================= ADMIN APP =================
 function AdminApp({ state, persist, onLogout, cloudStatus }) {
   const [tab, setTab] = useState('overview');
+  const [moreOpen, setMoreOpen] = useState(false);
 
   const lockShift = async (shiftId) => {
     await persist({ ...state, shifts: state.shifts.map(s => s.id === shiftId ? { ...s, status: 'locked' } : s) });
@@ -1492,7 +1493,7 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
         </div>
       </div>
 
-      <div style={{ display: 'flex', gap: 4, padding: '16px 20px 0', overflowX: 'auto' }}>
+      <div className="admin-tabs-desktop" style={{ gap: 4, padding: '16px 20px 0', overflowX: 'auto' }}>
         {[
           { id: 'overview', label: 'Σήμερα' },
           { id: 'map', label: 'Χάρτης' },
@@ -1510,6 +1511,56 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
             border: 'none', borderRadius: 8, padding: '9px 14px', fontSize: 13, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap',
           }}>{t.label}</button>
         ))}
+      </div>
+
+      <div className="admin-tabs-mobile" style={{ gap: 4, padding: '16px 20px 0', overflowX: 'auto', position: 'relative' }}>
+        {[
+          { id: 'overview', label: 'Σήμερα' },
+          { id: 'calendar', label: 'Ημερολόγιο' },
+          { id: 'appointments', label: 'Αναθέσεις' },
+          { id: 'shifts', label: 'Βάρδιες' },
+        ].map(t => (
+          <button key={t.id} onClick={() => { setTab(t.id); setMoreOpen(false); }} style={{
+            background: tab === t.id ? ACCENT : 'transparent', color: tab === t.id ? BG : MUTE,
+            border: 'none', borderRadius: 8, padding: '9px 14px', fontSize: 13, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap',
+          }}>{t.label}</button>
+        ))}
+
+        {(() => {
+          const moreTabs = [
+            { id: 'map', label: 'Χάρτης' },
+            { id: 'schedule', label: 'Πρόγραμμα' },
+            { id: 'bookings', label: 'Διαδρομές οδηγών' },
+            { id: 'reports', label: 'Αναφορές' },
+            { id: 'fleet', label: 'Στόλος & Οδηγοί' },
+            { id: 'maintenance', label: 'Service' },
+          ];
+          const activeMoreTab = moreTabs.find(t => t.id === tab);
+          return (
+            <div style={{ position: 'relative' }}>
+              <button onClick={() => setMoreOpen(v => !v)} style={{
+                background: activeMoreTab ? ACCENT : 'transparent', color: activeMoreTab ? BG : MUTE,
+                border: `1px solid ${activeMoreTab ? ACCENT : BORDER}`, borderRadius: 8, padding: '9px 14px', fontSize: 13, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap',
+                display: 'flex', alignItems: 'center', gap: 6,
+              }}>
+                {activeMoreTab ? activeMoreTab.label : 'Περισσότερα'} <ChevronRight size={14} style={{ transform: moreOpen ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.15s' }} />
+              </button>
+              {moreOpen && (
+                <>
+                  <div onClick={() => setMoreOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 19 }} />
+                  <div style={{ position: 'absolute', top: '110%', left: 0, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 6, zIndex: 20, minWidth: 180, boxShadow: '0 8px 24px rgba(0,0,0,0.4)' }}>
+                    {moreTabs.map(t => (
+                      <button key={t.id} onClick={() => { setTab(t.id); setMoreOpen(false); }} style={{
+                        display: 'block', width: '100%', textAlign: 'left', background: tab === t.id ? 'rgba(245,185,66,0.12)' : 'none',
+                        color: tab === t.id ? ACCENT : TEXT, border: 'none', borderRadius: 6, padding: '9px 12px', fontSize: 13, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap',
+                      }}>{t.label}</button>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+          );
+        })()}
       </div>
 
       <div style={{ padding: 20, maxWidth: 960 }}>
