@@ -1513,7 +1513,7 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
         ))}
       </div>
 
-      <div className="admin-tabs-mobile" style={{ gap: 4, padding: '16px 20px 0', overflowX: 'auto', position: 'relative' }}>
+      <div className="admin-tabs-mobile" style={{ gap: 4, padding: '16px 20px 0', position: 'relative', flexWrap: 'wrap' }}>
         {[
           { id: 'overview', label: 'Σήμερα' },
           { id: 'calendar', label: 'Ημερολόγιο' },
