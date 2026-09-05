@@ -599,7 +599,6 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
       </div>
 
       <div style={{ padding: 20 }}>
-        <div style={{ color: MUTE, fontSize: 10, marginBottom: 8 }}>[debug] notifPermission: {notifPermission}</div>
         {notifPermission === 'default' && (
           <button
             onClick={requestNotifPermission}
