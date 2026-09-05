@@ -13,3 +13,15 @@ self.addEventListener('fetch', (event) => {
   // Pass-through: always go to network. No offline cache of app data.
   event.respondWith(fetch(event.request).catch(() => new Response('Χωρίς σύνδεση', { status: 503 })));
 });
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
+      for (const client of clients) {
+        if ('focus' in client) return client.focus();
+      }
+      if (self.clients.openWindow) return self.clients.openWindow('/');
+    })
+  );
+});
