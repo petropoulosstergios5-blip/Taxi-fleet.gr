@@ -463,6 +463,39 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
     await persist({ ...state, appointments: state.appointments.map(a => a.id === id ? { ...a, ...patch } : a) });
   };
 
+  // Notifications for newly assigned appointments — works while the app is open or
+  // backgrounded (screen locked, switched to another app), NOT if fully force-closed;
+  // that would need a real push-notification backend, a separate project.
+  const [notifPermission, setNotifPermission] = useState(
+    typeof Notification !== 'undefined' ? Notification.permission : 'unsupported'
+  );
+  const requestNotifPermission = () => {
+    if (typeof Notification === 'undefined') return;
+    Notification.requestPermission().then(setNotifPermission);
+  };
+  const notifiedRef = useRef(new Set(
+    JSON.parse(localStorage.getItem(`taxifleet:notified:${driverId}`) || '[]')
+  ));
+  useEffect(() => {
+    if (notifPermission !== 'granted') return;
+    const assignedNow = state.appointments.filter(a => a.driverId === driverId && a.status === 'assigned');
+    const newOnes = assignedNow.filter(a => !notifiedRef.current.has(a.id));
+    if (newOnes.length === 0) return;
+    newOnes.forEach(a => {
+      notifiedRef.current.add(a.id);
+      if (navigator.serviceWorker) {
+        navigator.serviceWorker.ready.then(reg => {
+          reg.showNotification('Νέο ραντεβού', {
+            body: `${a.time} · ${a.pickup} → ${a.dropoff}`,
+            icon: '/icon-192.png',
+            tag: a.id,
+          });
+        }).catch(() => {});
+      }
+    });
+    try { localStorage.setItem(`taxifleet:notified:${driverId}`, JSON.stringify([...notifiedRef.current])); } catch (e) {}
+  }, [state.appointments, driverId, notifPermission]);
+
   // Live location — only while the app is open in the foreground and a shift is active.
   // A ref holds the latest state so the interval always writes on top of current data,
   // not a stale snapshot from when the effect first ran.
@@ -566,6 +599,15 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
       </div>
 
       <div style={{ padding: 20 }}>
+        {notifPermission === 'default' && (
+          <button
+            onClick={requestNotifPermission}
+            style={{ width: '100%', background: 'rgba(245,185,66,0.12)', border: `1px solid ${ACCENT}`, borderRadius: 10, padding: 12, color: ACCENT, fontSize: 13, fontWeight: 700, cursor: 'pointer', marginBottom: 16, textAlign: 'left' }}
+          >
+            🔔 Ενεργοποίησε ειδοποιήσεις για νέα ραντεβού
+          </button>
+        )}
+
         {myAppointmentsToday.length > 0 && (
           <div style={{ marginBottom: 20 }}>
             <div style={{ color: TEXT, fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Αναθέσεις σήμερα</div>
