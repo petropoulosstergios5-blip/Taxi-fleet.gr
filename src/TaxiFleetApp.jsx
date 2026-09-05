@@ -786,6 +786,12 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
             </div>
             <div style={{ color: TEXT, fontSize: 14 }}>Έναρξη {new Date(activeShift.startTime).toLocaleTimeString('el-GR', { hour: '2-digit', minute: '2-digit', hour12: false })} · {activeShift.startKm} χλμ</div>
             <div style={{ color: MUTE, fontSize: 13, marginBottom: 16 }}>Αρχικό ταμείο: {fmtEUR(activeShift.startCash)}</div>
+            <div style={{ borderTop: `1px solid ${BORDER}`, paddingTop: 12, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span style={{ color: MUTE, fontSize: 12 }}>Τζίρος βάρδιας (live)</span>
+              <span style={{ color: ACCENT, fontSize: 22, fontWeight: 700 }}>
+                {fmtEUR(state.bookings.filter(b => b.shiftId === activeShift.id).reduce((sum, b) => sum + (Number(b.price) || 0), 0))}
+              </span>
+            </div>
           </div>
         ) : (
           <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 16, padding: 20, marginBottom: 20, textAlign: 'center' }}>
