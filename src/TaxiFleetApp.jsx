@@ -968,6 +968,9 @@ function EndShiftScreen({ state, driver, shift, onBack, onSubmit }) {
   const totalRevenue = (Number(cash) || 0) + (Number(card) || 0) + (Number(app) || 0);
   const netResult = totalRevenue - (Number(expenses) || 0) - (Number(fuel) || 0);
   const canSubmit = kmValid && cash !== '' && card !== '' && app !== '' && photoStatus !== 'uploading';
+  const bookingsTotal = state.bookings.filter(b => b.shiftId === shift.id).reduce((sum, b) => sum + (Number(b.price) || 0), 0);
+  const diff = totalRevenue - bookingsTotal;
+  const hasEnteredAmounts = cash !== '' || card !== '' || app !== '';
 
   return (
     <Screen title="Κλείσιμο Βάρδιας" subtitle={`${carLabelById(state, shift.car)} · ξεκίνησε στα ${shift.startKm} χλμ`} onBack={onBack}>
@@ -991,6 +994,21 @@ function EndShiftScreen({ state, driver, shift, onBack, onSubmit }) {
           <input type="number" value={app} onChange={e => setApp(e.target.value)} style={{ ...input, marginBottom: 0 }} />
         </div>
       </div>
+
+      {bookingsTotal > 0 && (
+        <div style={{
+          background: !hasEnteredAmounts ? CARD : Math.abs(diff) < 0.01 ? 'rgba(74,155,110,0.12)' : Math.abs(diff) <= 5 ? 'rgba(245,185,66,0.12)' : 'rgba(193,84,60,0.12)',
+          border: `1px solid ${!hasEnteredAmounts ? BORDER : Math.abs(diff) < 0.01 ? GREEN : Math.abs(diff) <= 5 ? ACCENT : RED}`,
+          borderRadius: 10, padding: 12, marginBottom: 16, fontSize: 12,
+        }}>
+          <div style={{ color: MUTE }}>Άθροισμα καταγεγραμμένων διαδρομών αυτής της βάρδιας: <b style={{ color: TEXT }}>{fmtEUR(bookingsTotal)}</b></div>
+          {hasEnteredAmounts && (
+            <div style={{ color: Math.abs(diff) < 0.01 ? GREEN : Math.abs(diff) <= 5 ? ACCENT : RED, marginTop: 4, fontWeight: 600 }}>
+              {Math.abs(diff) < 0.01 ? '✓ Ταιριάζει ακριβώς' : `Διαφορά ${diff > 0 ? '+' : ''}${fmtEUR(diff)} από ό,τι καταχώρησες παραπάνω`}
+            </div>
+          )}
+        </div>
+      )}
 
       <label style={{ ...label, marginTop: 16 }}>Έξοδα (€)</label>
       <input type="number" value={expenses} onChange={e => setExpenses(e.target.value)} placeholder="π.χ. 5" style={input} />
@@ -1179,10 +1197,10 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
           { id: 'overview', label: 'Σήμερα' },
           { id: 'map', label: 'Χάρτης' },
           { id: 'calendar', label: 'Ημερολόγιο' },
-          { id: 'appointments', label: 'Ραντεβού' },
+          { id: 'appointments', label: 'Αναθέσεις' },
           { id: 'shifts', label: 'Βάρδιες' },
           { id: 'schedule', label: 'Πρόγραμμα' },
-          { id: 'bookings', label: 'Προμισθώσεις' },
+          { id: 'bookings', label: 'Διαδρομές οδηγών' },
           { id: 'reports', label: 'Αναφορές' },
           { id: 'fleet', label: 'Στόλος & Οδηγοί' },
           { id: 'maintenance', label: 'Service' },
@@ -2207,12 +2225,16 @@ function AppointmentsHistoryTab({ state, persist }) {
 
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
-        <div style={{ color: TEXT, fontSize: 15, fontWeight: 700 }}>Ιστορικό ραντεβού</div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 4 }}>
+        <div>
+          <div style={{ color: TEXT, fontSize: 15, fontWeight: 700 }}>Αναθέσεις</div>
+          <div style={{ color: MUTE, fontSize: 12, marginTop: 2 }}>Δρομολόγια που αναθέτεις εσύ σε συγκεκριμένο οδηγό/όχημα</div>
+        </div>
         <button onClick={() => setShowNew(true)} style={{ background: ACCENT, color: BG, border: 'none', borderRadius: 8, padding: '9px 14px', fontSize: 13, fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6 }}>
           <Plus size={15} /> Νέο
         </button>
       </div>
+      <div style={{ marginBottom: 14 }} />
 
       {avgExecMin != null && (
         <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
@@ -2300,6 +2322,9 @@ function TodayTab({ state, onLock, onUnlock }) {
           const revenue = (s.cash || 0) + (s.card || 0) + (s.app || 0);
           const km = s.endKm ? s.endKm - s.startKm : null;
           const gpsFlag = km != null && s.gpsStart && s.gpsEnd; // presence check only in prototype
+          const bookingsTotal = state.bookings.filter(b => b.shiftId === s.id).reduce((sum, b) => sum + (Number(b.price) || 0), 0);
+          const diff = revenue - bookingsTotal;
+          const diffColor = Math.abs(diff) < 0.01 ? GREEN : Math.abs(diff) <= 5 ? ACCENT : RED;
           return (
             <div key={s.id} style={{ background: CARD, borderRadius: 14, padding: 16, border: `1px solid ${BORDER}` }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
@@ -2313,6 +2338,9 @@ function TodayTab({ state, onLock, onUnlock }) {
               </div>
               <div style={{ display: 'flex', gap: 20, marginTop: 8, flexWrap: 'wrap' }}>
                 <MiniStat label="Τζίρος" value={fmtEUR(revenue)} color={GREEN} />
+                {s.status !== 'active' && bookingsTotal > 0 && (
+                  <MiniStat label="vs Διαδρομές οδηγού" value={`${diff > 0 ? '+' : ''}${fmtEUR(diff)}`} color={diffColor} />
+                )}
                 <MiniStat label="Χλμ" value={km != null ? km : '—'} />
                 <MiniStat label="Καύσιμο" value={fmtEUR(s.fuel)} />
                 {s.fuelReceiptPhoto && (
@@ -2382,7 +2410,7 @@ function AllShiftsTab({ state, persist, onLock, onUnlock }) {
         <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
           <thead>
             <tr style={{ textAlign: 'left', color: MUTE }}>
-              {['Όχημα', 'Οδηγός', 'Ημ/νία', 'Χλμ', 'Τζίρος', 'Καθαρό', 'Κατάσταση', ''].map(h => (
+              {['Όχημα', 'Οδηγός', 'Ημ/νία', 'Χλμ', 'Τζίρος', 'Διαφορά*', 'Καθαρό', 'Κατάσταση', ''].map(h => (
                 <th key={h} style={{ padding: '8px 10px', fontWeight: 500 }}>{h}</th>
               ))}
             </tr>
@@ -2392,6 +2420,9 @@ function AllShiftsTab({ state, persist, onLock, onUnlock }) {
               const driver = state.drivers.find(d => d.id === s.driverId);
               const revenue = s.status === 'active' ? null : (s.cash || 0) + (s.card || 0) + (s.app || 0);
               const net = revenue != null ? revenue - (s.expenses || 0) - (s.fuel || 0) : null;
+              const bookingsTotal = state.bookings.filter(b => b.shiftId === s.id).reduce((sum, b) => sum + (Number(b.price) || 0), 0);
+              const diff = revenue != null ? revenue - bookingsTotal : null;
+              const diffColor = diff == null ? MUTE : Math.abs(diff) < 0.01 ? GREEN : Math.abs(diff) <= 5 ? ACCENT : RED;
               return (
                 <tr key={s.id} style={{ borderTop: `1px solid ${CARD}` }}>
                   <td style={td}>{carLabelById(state, s.car)}</td>
@@ -2399,6 +2430,7 @@ function AllShiftsTab({ state, persist, onLock, onUnlock }) {
                   <td style={td}>{s.date}</td>
                   <td style={td}>{s.endKm ? s.endKm - s.startKm : '—'}</td>
                   <td style={{ ...td, color: GREEN, fontWeight: 600 }}>{revenue != null ? fmtEUR(revenue) : '—'}</td>
+                  <td style={{ ...td, color: diffColor, fontWeight: 600 }}>{diff != null && bookingsTotal > 0 ? `${diff > 0 ? '+' : ''}${fmtEUR(diff)}` : '—'}</td>
                   <td style={{ ...td, color: net != null ? (net >= 0 ? GREEN : RED) : TEXT, fontWeight: 600 }}>{net != null ? fmtEUR(net) : '—'}</td>
                   <td style={td}><StatusBadge status={s.status} /></td>
                   <td style={td}>
@@ -2413,6 +2445,7 @@ function AllShiftsTab({ state, persist, onLock, onUnlock }) {
         </table>
         {sorted.length === 0 && <div style={{ color: MUTE, fontSize: 13, padding: '16px 0' }}>Καμία βάρδια ακόμα</div>}
       </div>
+      <div style={{ color: MUTE, fontSize: 11, marginTop: 8 }}>* Διαφορά = Τζίρος βάρδιας − άθροισμα καταγεγραμμένων διαδρομών οδηγού (καθαρά ενημερωτικό, δεν σημαίνει απαραίτητα λάθος)</div>
       {editingShift && <EditShiftModal state={state} persist={persist} shift={editingShift} onClose={() => setEditingShift(null)} />}
     </div>
   );
@@ -2515,7 +2548,8 @@ function BookingsTab({ state, persist }) {
   const sorted = state.bookings.slice().sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   return (
     <div>
-      <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Προμισθώσεις</div>
+      <div style={{ color: TEXT, fontSize: 15, fontWeight: 700 }}>Διαδρομές οδηγών</div>
+      <div style={{ color: MUTE, fontSize: 12, marginTop: 2, marginBottom: 12 }}>Διαδρομές που καταγράφει ο ίδιος ο οδηγός κατά τη βάρδια του (όχι αναθέσεις από σένα)</div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         {sorted.map(b => {
           const driver = state.drivers.find(d => d.id === b.driverId);
