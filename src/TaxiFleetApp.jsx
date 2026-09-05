@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { createClient } from '@supabase/supabase-js';
-import { Car, Clock, MapPin, Fuel, AlertCircle, CheckCircle2, Plus, X, ChevronRight, Navigation, Calendar, User, LogOut, Gauge, Wallet, ArrowLeft, Lock, Camera, CreditCard, Banknote, Smartphone, Plane, Users, Unlock, Filter, XCircle, PlayCircle, Flag } from 'lucide-react';
+import { Car, Clock, MapPin, Fuel, AlertCircle, CheckCircle2, Plus, X, ChevronRight, Navigation, Calendar, User, LogOut, Gauge, Wallet, ArrowLeft, Lock, Camera, CreditCard, Banknote, Smartphone, Plane, Users, Unlock, Filter, XCircle, PlayCircle, Flag, Eye, EyeOff } from 'lucide-react';
 
 // --- Supabase (cloud sync) ---
 // Publishable/anon keys are meant to be embedded in client code — that's how Supabase works.
@@ -1782,6 +1782,7 @@ function AdminAccountModal({ state, persist, onClose }) {
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [error, setError] = useState('');
+  const [showCurrentPw, setShowCurrentPw] = useState(false);
 
   const submit = async () => {
     if (currentPassword !== state.adminPassword) { setError('Λάθος τρέχων κωδικός.'); return; }
@@ -1801,6 +1802,25 @@ function AdminAccountModal({ state, persist, onClose }) {
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
           <div style={{ color: TEXT, fontSize: 17, fontWeight: 700 }}>Στοιχεία σύνδεσης διαχειριστή</div>
           <button onClick={onClose} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer' }}><X size={20} /></button>
+        </div>
+
+        <div style={{ background: CARD, borderRadius: 10, padding: 14, marginBottom: 20, border: `1px solid ${BORDER}` }}>
+          <div style={{ color: MUTE, fontSize: 11, marginBottom: 8 }}>ΤΡΕΧΟΝΤΑ ΣΤΟΙΧΕΙΑ</div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+            <span style={{ color: MUTE, fontSize: 13 }}>Όνομα χρήστη</span>
+            <span style={{ color: TEXT, fontSize: 13, fontWeight: 600 }}>{state.adminUsername}</span>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span style={{ color: MUTE, fontSize: 13 }}>Κωδικός</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ color: TEXT, fontSize: 13, fontWeight: 600, fontFamily: 'monospace' }}>
+                {showCurrentPw ? state.adminPassword : '•'.repeat(state.adminPassword.length)}
+              </span>
+              <button onClick={() => setShowCurrentPw(v => !v)} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer', display: 'flex', padding: 2 }} title={showCurrentPw ? 'Απόκρυψη' : 'Εμφάνιση'}>
+                {showCurrentPw ? <EyeOff size={16} /> : <Eye size={16} />}
+              </button>
+            </div>
+          </div>
         </div>
 
         <label style={label}>Τρέχων κωδικός (για επιβεβαίωση)</label>
