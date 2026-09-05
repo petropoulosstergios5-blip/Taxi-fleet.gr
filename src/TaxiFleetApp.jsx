@@ -266,18 +266,10 @@ function classifyShift(startTime) {
 // Uncovered stretches of a given day for a given car, based on all shift entries assigned
 // to it that day. An overnight shift (end time <= start time) is capped at 24:00 for this
 // day's view — the portion past midnight isn't carried into the next day's calculation.
-function computeCarGaps(schedule, weekStart, day, carId) {
-  const intervals = schedule
-    .filter(e => e.weekStart === weekStart && e.day === day && e.car === carId && e.type === 'shift' && e.startTime && e.endTime)
-    .map(e => {
-      const s = timeToMin(e.startTime);
-      let en = timeToMin(e.endTime);
-      if (en <= s) en = 24 * 60;
-      return [s, en];
-    })
-    .sort((a, b) => a[0] - b[0]);
+function mergeIntervalsToGaps(intervals) {
+  const sorted = intervals.slice().sort((a, b) => a[0] - b[0]);
   const merged = [];
-  for (const [s, e] of intervals) {
+  for (const [s, e] of sorted) {
     if (merged.length && s <= merged[merged.length - 1][1]) {
       merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], e);
     } else merged.push([s, e]);
@@ -290,6 +282,48 @@ function computeCarGaps(schedule, weekStart, day, carId) {
   }
   if (cursor < 24 * 60) gaps.push([cursor, 24 * 60]);
   return gaps.map(([s, e]) => `${minToTime(s)}–${minToTime(e)}`);
+}
+
+// Coverage from the PLANNED weekly roster — used only for days that haven't happened yet.
+function computeCarGapsFromSchedule(schedule, weekStart, day, carId) {
+  const intervals = schedule
+    .filter(e => e.weekStart === weekStart && e.day === day && e.car === carId && e.type === 'shift' && e.startTime && e.endTime)
+    .map(e => {
+      const s = timeToMin(e.startTime);
+      let en = timeToMin(e.endTime);
+      if (en <= s) en = 24 * 60;
+      return [s, en];
+    });
+  return mergeIntervalsToGaps(intervals);
+}
+
+function isoTimeToMin(isoStr) {
+  const d = new Date(isoStr);
+  return d.getHours() * 60 + d.getMinutes();
+}
+
+// Coverage from what ACTUALLY happened (real shift records) — used for today and past
+// days, so a no-show or a schedule change is reflected correctly instead of showing
+// the plan as if it were followed.
+function computeCarGapsFromShifts(shifts, dateIso, carId) {
+  const isToday = dateIso === isoDateStr(new Date());
+  const nowMin = new Date().getHours() * 60 + new Date().getMinutes();
+  const intervals = shifts
+    .filter(s => s.car === carId && s.date === dateIso)
+    .map(s => {
+      const start = isoTimeToMin(s.startTime);
+      let end;
+      if (s.endTime) {
+        end = isoTimeToMin(s.endTime);
+        if (end <= start) end = 24 * 60; // overnight shift, capped at midnight for this day
+      } else {
+        // still active: ongoing until now if it's today, otherwise we don't know when it
+        // ended so we don't assume — cap at end of day rather than guess.
+        end = isToday ? Math.max(start, nowMin) : 24 * 60;
+      }
+      return [start, end];
+    });
+  return mergeIntervalsToGaps(intervals);
 }
 
 const STATUS_META = {
@@ -1735,15 +1769,24 @@ function ScheduleTab({ state, persist }) {
       </div>
 
       <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Κάλυψη οχημάτων</div>
-      <div style={{ color: MUTE, fontSize: 12, marginBottom: 12 }}>Ώρες που κανένα ραντεβού δεν καλύπτει το κάθε όχημα αυτή την εβδομάδα — υπολογίζεται αυτόματα από το πρόγραμμα.</div>
+      <div style={{ color: MUTE, fontSize: 12, marginBottom: 12 }}>
+        Σήμερα και παλιότερες μέρες: υπολογίζεται από τις πραγματικές βάρδιες (τι όντως έγινε). Μελλοντικές μέρες: από το προγραμματισμένο πρόγραμμα.
+      </div>
       <div style={{ overflowX: 'auto' }}>
         <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
           <thead>
             <tr>
               <th style={{ ...td, color: MUTE, fontWeight: 500, textAlign: 'left', minWidth: 90 }}>Όχημα</th>
-              {[0, 1, 2, 3, 4, 5, 6].map(day => (
-                <th key={day} style={{ ...td, color: MUTE, fontWeight: 500, minWidth: 130 }}>{DAY_LABELS_SHORT[day]}</th>
-              ))}
+              {[0, 1, 2, 3, 4, 5, 6].map(day => {
+                const dateIso = addDaysIso(weekStart, day);
+                const isPastOrToday = dateIso <= isoDateStr(new Date());
+                return (
+                  <th key={day} style={{ ...td, color: MUTE, fontWeight: 500, minWidth: 130 }}>
+                    {DAY_LABELS_SHORT[day]}
+                    <div style={{ fontSize: 9, fontWeight: 400, color: isPastOrToday ? GREEN : ACCENT }}>{isPastOrToday ? 'πραγματικό' : 'προγρ/σμένο'}</div>
+                  </th>
+                );
+              })}
             </tr>
           </thead>
           <tbody>
@@ -1751,7 +1794,11 @@ function ScheduleTab({ state, persist }) {
               <tr key={c.id} style={{ borderTop: `1px solid ${CARD}` }}>
                 <td style={{ ...td, fontWeight: 600 }}>{carLabel(c)}</td>
                 {[0, 1, 2, 3, 4, 5, 6].map(day => {
-                  const gaps = computeCarGaps(state.schedule, weekStart, day, c.id);
+                  const dateIso = addDaysIso(weekStart, day);
+                  const isPastOrToday = dateIso <= isoDateStr(new Date());
+                  const gaps = isPastOrToday
+                    ? computeCarGapsFromShifts(state.shifts, dateIso, c.id)
+                    : computeCarGapsFromSchedule(state.schedule, weekStart, day, c.id);
                   const fullyEmpty = gaps.length === 1 && gaps[0] === '00:00–24:00';
                   return (
                     <td key={day} style={{ ...td, color: fullyEmpty ? MUTE : gaps.length ? RED : GREEN, fontSize: 11 }}>
