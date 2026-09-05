@@ -79,7 +79,7 @@ const initialState = {
     { id: 'TAXI 3', outOfService: false, baseKm: 0, serviceIntervalKm: 10000, lastServiceKm: 0, serviceHistory: [], brand: '', model: '', year: '' },
   ],
   shifts: [], // {id, driverId, car, date, startTime, endTime, startKm, endKm, startCash, cash, card, app, expenses, fuel, fuelReceiptPhoto, gpsStart, gpsEnd, status: 'active'|'closed'|'locked', notes}
-  bookings: [], // driver-logged completed rides during a shift: {id, shiftId, driverId, flightNumber, arrivalTime, customerName, passengers, destination, price, notes, status:'open'|'done'}
+  bookings: [], // driver-logged completed rides during a shift: {id, shiftId, driverId, flightNumber, arrivalTime, customerName, passengers, destination, price, paymentMethod:'cash'|'card'|'app', notes, status:'open'|'done'}
   appointments: [], // admin-scheduled dispatch jobs: {id, date, time, durationMin, pickup, dropoff, customerName, driverId, car, status, notes,
                      //   createdAt, assignedAt, acceptedAt, arrivedAt, completedAt}
   schedule: [], // weekly roster entries: {id, weekStart (Monday, ISO), driverId, day (0=Mon..6=Sun), slot: 'morning'|'night'|'rest', car}
@@ -887,9 +887,15 @@ function BookingScreen({ state, driver, shift, onBack, onSubmit }) {
   const [passengers, setPassengers] = useState('1');
   const [destination, setDestination] = useState('');
   const [price, setPrice] = useState('');
+  const [paymentMethod, setPaymentMethod] = useState('cash'); // 'cash' | 'card' | 'app'
   const [notes, setNotes] = useState('');
 
   const canSubmit = customerName && destination && price;
+  const PAY_OPTIONS = [
+    { id: 'cash', label: 'Μετρητά', icon: Banknote },
+    { id: 'card', label: 'Κάρτα', icon: CreditCard },
+    { id: 'app', label: 'App', icon: Smartphone },
+  ];
 
   return (
     <Screen title="Νέα Προμίσθωση" subtitle={carLabelById(state, shift?.car || driver.car)} onBack={onBack}>
@@ -911,11 +917,31 @@ function BookingScreen({ state, driver, shift, onBack, onSubmit }) {
       <label style={label}>Τιμή (€)</label>
       <input type="number" value={price} onChange={e => setPrice(e.target.value)} placeholder="π.χ. 35" style={input} />
 
+      <label style={label}>Τρόπος πληρωμής</label>
+      <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+        {PAY_OPTIONS.map(opt => (
+          <button
+            key={opt.id}
+            onClick={() => setPaymentMethod(opt.id)}
+            style={{
+              flex: 1, padding: 10, borderRadius: 10, cursor: 'pointer',
+              border: `1px solid ${paymentMethod === opt.id ? ACCENT : BORDER}`,
+              background: paymentMethod === opt.id ? 'rgba(245,185,66,0.12)' : 'none',
+              color: paymentMethod === opt.id ? ACCENT : MUTE,
+              display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, fontSize: 12, fontWeight: 600,
+            }}
+          >
+            <opt.icon size={16} />
+            {opt.label}
+          </button>
+        ))}
+      </div>
+
       <label style={label}>Σημειώσεις (προαιρετικό)</label>
       <textarea value={notes} onChange={e => setNotes(e.target.value)} rows={2} style={{ ...input, resize: 'vertical' }} />
 
       <button
-        onClick={() => canSubmit && onSubmit({ flightNumber, arrivalTime, customerName, passengers: Number(passengers), destination, price: Number(price), notes, createdAt: new Date().toISOString() })}
+        onClick={() => canSubmit && onSubmit({ flightNumber, arrivalTime, customerName, passengers: Number(passengers), destination, price: Number(price), paymentMethod, notes, createdAt: new Date().toISOString() })}
         disabled={!canSubmit}
         style={{ ...btnPrimary, justifyContent: 'center', marginTop: 4, opacity: canSubmit ? 1 : 0.5, cursor: canSubmit ? 'pointer' : 'not-allowed' }}
       >
@@ -968,7 +994,12 @@ function EndShiftScreen({ state, driver, shift, onBack, onSubmit }) {
   const totalRevenue = (Number(cash) || 0) + (Number(card) || 0) + (Number(app) || 0);
   const netResult = totalRevenue - (Number(expenses) || 0) - (Number(fuel) || 0);
   const canSubmit = kmValid && cash !== '' && card !== '' && app !== '' && photoStatus !== 'uploading';
-  const bookingsTotal = state.bookings.filter(b => b.shiftId === shift.id).reduce((sum, b) => sum + (Number(b.price) || 0), 0);
+  const shiftBookings = state.bookings.filter(b => b.shiftId === shift.id);
+  const byMethod = (method) => shiftBookings.filter(b => (b.paymentMethod || 'cash') === method);
+  const sumOf = (list) => list.reduce((sum, b) => sum + (Number(b.price) || 0), 0);
+  const cashBookings = byMethod('cash'), cardBookings = byMethod('card'), appBookings = byMethod('app');
+  const cashFromBookings = sumOf(cashBookings), cardFromBookings = sumOf(cardBookings), appFromBookings = sumOf(appBookings);
+  const bookingsTotal = cashFromBookings + cardFromBookings + appFromBookings;
   const diff = totalRevenue - bookingsTotal;
   const hasEnteredAmounts = cash !== '' || card !== '' || app !== '';
 
@@ -983,15 +1014,24 @@ function EndShiftScreen({ state, driver, shift, onBack, onSubmit }) {
       <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
         <div style={{ flex: 1 }}>
           <label style={label}><Banknote size={13} style={{ verticalAlign: 'middle', marginRight: 4 }} />Μετρητά</label>
-          <input type="number" value={cash} onChange={e => setCash(e.target.value)} style={{ ...input, marginBottom: 0 }} />
+          <input type="number" value={cash} onChange={e => setCash(e.target.value)} style={{ ...input, marginBottom: 4 }} />
+          {cashBookings.length > 0 && (
+            <div style={{ color: ACCENT, fontSize: 11 }}>{cashBookings.length} διαδρ.: +{fmtEUR(cashFromBookings)}</div>
+          )}
         </div>
         <div style={{ flex: 1 }}>
           <label style={label}><CreditCard size={13} style={{ verticalAlign: 'middle', marginRight: 4 }} />Κάρτες</label>
-          <input type="number" value={card} onChange={e => setCard(e.target.value)} style={{ ...input, marginBottom: 0 }} />
+          <input type="number" value={card} onChange={e => setCard(e.target.value)} style={{ ...input, marginBottom: 4 }} />
+          {cardBookings.length > 0 && (
+            <div style={{ color: ACCENT, fontSize: 11 }}>{cardBookings.length} διαδρ.: +{fmtEUR(cardFromBookings)}</div>
+          )}
         </div>
         <div style={{ flex: 1 }}>
           <label style={label}><Smartphone size={13} style={{ verticalAlign: 'middle', marginRight: 4 }} />App</label>
-          <input type="number" value={app} onChange={e => setApp(e.target.value)} style={{ ...input, marginBottom: 0 }} />
+          <input type="number" value={app} onChange={e => setApp(e.target.value)} style={{ ...input, marginBottom: 4 }} />
+          {appBookings.length > 0 && (
+            <div style={{ color: ACCENT, fontSize: 11 }}>{appBookings.length} διαδρ.: +{fmtEUR(appFromBookings)}</div>
+          )}
         </div>
       </div>
 
@@ -1001,10 +1041,14 @@ function EndShiftScreen({ state, driver, shift, onBack, onSubmit }) {
           border: `1px solid ${!hasEnteredAmounts ? BORDER : Math.abs(diff) < 0.01 ? GREEN : Math.abs(diff) <= 5 ? ACCENT : RED}`,
           borderRadius: 10, padding: 12, marginBottom: 16, fontSize: 12,
         }}>
-          <div style={{ color: MUTE }}>Άθροισμα καταγεγραμμένων διαδρομών αυτής της βάρδιας: <b style={{ color: TEXT }}>{fmtEUR(bookingsTotal)}</b></div>
+          <div style={{ color: MUTE, marginBottom: 4 }}>
+            Οι παραπάνω υπενθυμίσεις (κίτρινο) είναι τα ποσά από τις διαδρομές που κατέγραψες μέσα στη βάρδια — <b style={{ color: TEXT }}>πρόσθεσέ τα</b> στο κάθε πεδίο μαζί με ό,τι άλλο εισέπραξες (π.χ. διαδρομές πιάτσας).
+          </div>
           {hasEnteredAmounts && (
-            <div style={{ color: Math.abs(diff) < 0.01 ? GREEN : Math.abs(diff) <= 5 ? ACCENT : RED, marginTop: 4, fontWeight: 600 }}>
-              {Math.abs(diff) < 0.01 ? '✓ Ταιριάζει ακριβώς' : `Διαφορά ${diff > 0 ? '+' : ''}${fmtEUR(diff)} από ό,τι καταχώρησες παραπάνω`}
+            <div style={{ color: Math.abs(diff) < 0.01 ? GREEN : Math.abs(diff) <= 5 ? ACCENT : RED, marginTop: 6, fontWeight: 600 }}>
+              {Math.abs(diff) < 0.01
+                ? '✓ Το σύνολο ταιριάζει ακριβώς με τις καταγεγραμμένες διαδρομές'
+                : `Το σύνολο που έγραψες είναι κατά ${diff > 0 ? '+' : ''}${fmtEUR(diff)} διαφορετικό από το άθροισμα των διαδρομών — φυσιολογικό αν υπήρξαν κι άλλες διαδρομές εκτός καταγραφής`}
             </div>
           )}
         </div>
@@ -2561,10 +2605,13 @@ function BookingsTab({ state, persist }) {
                   <div style={{ color: MUTE, fontSize: 12, display: 'flex', gap: 10, marginTop: 4, flexWrap: 'wrap' }}>
                     {b.flightNumber && <span><Plane size={11} style={{ verticalAlign: 'middle' }} /> {b.flightNumber} {b.arrivalTime}</span>}
                     <span><Users size={11} style={{ verticalAlign: 'middle' }} /> {b.passengers}</span>
-                    <span>{driver?.name} · {driver?.car}</span>
+                    <span>{driver?.name} · {carLabelById(state, driver?.car)}</span>
                   </div>
                 </div>
-                <div style={{ color: GREEN, fontSize: 15, fontWeight: 700 }}>{fmtEUR(b.price)}</div>
+                <div style={{ textAlign: 'right' }}>
+                  <div style={{ color: GREEN, fontSize: 15, fontWeight: 700 }}>{fmtEUR(b.price)}</div>
+                  <div style={{ color: MUTE, fontSize: 11 }}>{{ cash: 'Μετρητά', card: 'Κάρτα', app: 'App' }[b.paymentMethod || 'cash']}</div>
+                </div>
               </div>
               {b.notes && <div style={{ color: MUTE, fontSize: 12, marginTop: 8, borderTop: `1px solid ${BORDER}`, paddingTop: 8 }}>{b.notes}</div>}
               <div style={{ marginTop: 10 }}>
@@ -2587,6 +2634,7 @@ function EditBookingModal({ state, persist, booking, onClose }) {
   const [passengers, setPassengers] = useState(String(booking.passengers ?? ''));
   const [destination, setDestination] = useState(booking.destination || '');
   const [price, setPrice] = useState(String(booking.price ?? ''));
+  const [paymentMethod, setPaymentMethod] = useState(booking.paymentMethod || 'cash');
   const [notes, setNotes] = useState(booking.notes || '');
 
   const save = async () => {
@@ -2598,6 +2646,7 @@ function EditBookingModal({ state, persist, booking, onClose }) {
         passengers: passengers === '' ? b.passengers : Number(passengers),
         destination,
         price: price === '' ? b.price : Number(price),
+        paymentMethod,
         notes,
       } : b),
     });
@@ -2639,6 +2688,13 @@ function EditBookingModal({ state, persist, booking, onClose }) {
             <input type="number" value={price} onChange={e => setPrice(e.target.value)} style={input} />
           </div>
         </div>
+
+        <label style={label}>Τρόπος πληρωμής</label>
+        <select value={paymentMethod} onChange={e => setPaymentMethod(e.target.value)} style={input}>
+          <option value="cash">Μετρητά</option>
+          <option value="card">Κάρτα</option>
+          <option value="app">App</option>
+        </select>
 
         <label style={label}>Σημειώσεις</label>
         <input value={notes} onChange={e => setNotes(e.target.value)} style={input} />
