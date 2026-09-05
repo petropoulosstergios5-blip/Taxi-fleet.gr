@@ -599,6 +599,7 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
       </div>
 
       <div style={{ padding: 20 }}>
+        <div style={{ color: MUTE, fontSize: 10, marginBottom: 8 }}>[debug] notifPermission: {notifPermission}</div>
         {notifPermission === 'default' && (
           <button
             onClick={requestNotifPermission}
@@ -606,6 +607,16 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
           >
             🔔 Ενεργοποίησε ειδοποιήσεις για νέα ραντεβού
           </button>
+        )}
+        {notifPermission === 'denied' && (
+          <div style={{ width: '100%', background: 'rgba(193,84,60,0.12)', border: `1px solid ${RED}`, borderRadius: 10, padding: 12, color: RED, fontSize: 13, marginBottom: 16 }}>
+            🔕 Οι ειδοποιήσεις είναι μπλοκαρισμένες για αυτή τη σελίδα. Άνοιξε τις ρυθμίσεις του browser (εικονίδιο 🔧/🔒 δίπλα στη διεύθυνση) → Άδειες ιστότοπου → Ειδοποιήσεις → Allow, μετά κάνε ανανέωση.
+          </div>
+        )}
+        {notifPermission === 'unsupported' && (
+          <div style={{ width: '100%', background: 'rgba(139,146,160,0.12)', border: `1px solid ${BORDER}`, borderRadius: 10, padding: 12, color: MUTE, fontSize: 13, marginBottom: 16 }}>
+            🔕 Αυτή η συσκευή/browser δεν υποστηρίζει ειδοποιήσεις.
+          </div>
         )}
 
         {myAppointmentsToday.length > 0 && (
