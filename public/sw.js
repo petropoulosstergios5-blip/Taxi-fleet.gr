@@ -25,3 +25,15 @@ self.addEventListener('notificationclick', (event) => {
     })
   );
 });
+
+self.addEventListener('push', (event) => {
+  let payload = { title: 'Ταξί Στόλος', body: 'Νέα ειδοποίηση' };
+  try { payload = event.data.json(); } catch (e) {}
+  event.waitUntil(
+    self.registration.showNotification(payload.title, {
+      body: payload.body,
+      icon: '/icon-192.png',
+      tag: payload.tag || undefined,
+    })
+  );
+});
