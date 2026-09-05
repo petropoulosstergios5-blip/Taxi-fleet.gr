@@ -45,6 +45,26 @@ function hydrateState(raw) {
 }
 
 const SEND_PUSH_URL = `${SUPABASE_URL}/functions/v1/send-push`;
+const PW_CRYPTO_URL = `${SUPABASE_URL}/functions/v1/pw-crypto`;
+async function pwCrypto(body) {
+  const res = await fetch(PW_CRYPTO_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  return res.json();
+}
+async function pwEncrypt(plaintext) {
+  const { ciphertext } = await pwCrypto({ action: 'encrypt', plaintext });
+  return ciphertext;
+}
+async function pwVerify(ciphertext, attempt) {
+  try {
+    const { ok } = await pwCrypto({ action: 'verify', ciphertext, attempt });
+    return !!ok;
+  } catch (e) {
+    return false;
+  }
+}
+async function pwReveal(ciphertext, adminCiphertext, adminAttempt) {
+  return pwCrypto({ action: 'reveal', ciphertext, adminCiphertext, adminAttempt }); // { ok, plaintext? }
+}
 async function sendPushToDriver(driverId, title, body, tag) {
   try {
     await fetch(SEND_PUSH_URL, {
@@ -435,14 +455,14 @@ export default function TaxiFleetApp() {
   }
 
   if (!session) {
-    return <LoginScreen drivers={state.drivers} adminUsername={state.adminUsername} adminPassword={state.adminPassword} onLogin={setSession} />;
+    return <LoginScreen state={state} persist={persist} drivers={state.drivers} adminUsername={state.adminUsername} adminPassword={state.adminPassword} onLogin={setSession} />;
   }
 
   if (session.role === 'driver') {
     const driverExists = state.drivers.some(d => d.id === session.driverId);
     if (!driverExists) {
       setSession(null);
-      return <LoginScreen drivers={state.drivers} adminUsername={state.adminUsername} adminPassword={state.adminPassword} onLogin={setSession} />;
+      return <LoginScreen state={state} persist={persist} drivers={state.drivers} adminUsername={state.adminUsername} adminPassword={state.adminPassword} onLogin={setSession} />;
     }
     return <DriverApp state={state} persist={persist} driverId={session.driverId} onLogout={() => setSession(null)} cloudStatus={cloudStatus} />;
   }
@@ -483,27 +503,45 @@ function CloudBadge({ status }) {
 }
 
 // ================= LOGIN =================
-function LoginScreen({ drivers, adminUsername, adminPassword, onLogin }) {
+function LoginScreen({ state, persist, drivers, adminUsername, adminPassword, onLogin }) {
   const [mode, setMode] = useState(null); // 'driver' | 'admin'
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
+  const [checking, setChecking] = useState(false);
 
-  const submitDriver = () => {
+  const submitDriver = async () => {
     const d = drivers.find(x => x.username === username.trim().toLowerCase());
-    if (!d || d.password !== password) {
-      setError('Λάθος όνομα χρήστη ή κωδικός');
-      return;
+    if (!d) { setError('Λάθος όνομα χρήστη ή κωδικός'); return; }
+    setChecking(true);
+    let ok = await pwVerify(d.password, password);
+    if (!ok && d.password === password) {
+      // Legacy plain-text account — the guess matches the raw stored value.
+      // Log them in, and quietly upgrade this one account to encrypted storage.
+      ok = true;
+      const ciphertext = await pwEncrypt(password);
+      await persist({ ...state, drivers: state.drivers.map(x => x.id === d.id ? { ...x, password: ciphertext } : x) });
     }
+    setChecking(false);
+    if (!ok) { setError('Λάθος όνομα χρήστη ή κωδικός'); return; }
     onLogin({ role: 'driver', driverId: d.id });
   };
 
-  const submitAdmin = () => {
-    if (username.trim().toLowerCase() === adminUsername.trim().toLowerCase() && password === adminPassword) {
-      onLogin({ role: 'admin' });
-    } else {
+  const submitAdmin = async () => {
+    if (username.trim().toLowerCase() !== adminUsername.trim().toLowerCase()) {
       setError('Λάθος στοιχεία διαχειριστή');
+      return;
     }
+    setChecking(true);
+    let ok = await pwVerify(adminPassword, password);
+    if (!ok && adminPassword === password) {
+      ok = true;
+      const ciphertext = await pwEncrypt(password);
+      await persist({ ...state, adminPassword: ciphertext });
+    }
+    setChecking(false);
+    if (!ok) { setError('Λάθος στοιχεία διαχειριστή'); return; }
+    onLogin({ role: 'admin' });
   };
 
   return (
@@ -537,12 +575,13 @@ function LoginScreen({ drivers, adminUsername, adminPassword, onLogin }) {
             {error && <div style={{ color: RED, fontSize: 13, marginBottom: 12 }}>{error}</div>}
             <button
               onClick={mode === 'driver' ? submitDriver : submitAdmin}
-              style={{ ...btnPrimary, justifyContent: 'center', marginTop: 8 }}
+              disabled={checking}
+              style={{ ...btnPrimary, justifyContent: 'center', marginTop: 8, opacity: checking ? 0.6 : 1, cursor: checking ? 'not-allowed' : 'pointer' }}
             >
-              Σύνδεση
+              {checking ? 'Έλεγχος...' : 'Σύνδεση'}
             </button>
             {mode === 'driver' && (
-              <div style={{ color: MUTE, fontSize: 11, marginTop: 14, textAlign: 'center' }}>Demo: giorgos / nikos / maria — κωδικός 1111</div>
+              <div style={{ height: 4 }} />
             )}
           </div>
         )}
@@ -2057,6 +2096,7 @@ function FleetTab({ state, persist }) {
 
       {editingDriver && (
         <DriverEditModal
+          state={state}
           driver={editingDriver === 'new' ? null : editingDriver}
           cars={state.cars}
           existingUsernames={state.drivers.filter(d => d.id !== (editingDriver?.id)).map(d => d.username)}
@@ -2068,23 +2108,75 @@ function FleetTab({ state, persist }) {
   );
 }
 
+function RevealPasswordButton({ state, ciphertext }) {
+  const [revealed, setRevealed] = useState(null); // plaintext string, or null
+  const [asking, setAsking] = useState(false);
+  const [adminPw, setAdminPw] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  if (revealed !== null) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span style={{ color: TEXT, fontSize: 13, fontWeight: 600, fontFamily: 'monospace' }}>{revealed}</span>
+        <button onClick={() => setRevealed(null)} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer', display: 'flex', padding: 2 }} title="Απόκρυψη">
+          <EyeOff size={16} />
+        </button>
+      </div>
+    );
+  }
+
+  if (asking) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <input
+          type="password" value={adminPw} onChange={e => setAdminPw(e.target.value)}
+          placeholder="Ο δικός σου κωδικός" autoFocus
+          style={{ ...input, marginBottom: 0, width: 130, padding: '5px 8px', fontSize: 12 }}
+        />
+        <button
+          disabled={busy || !adminPw}
+          onClick={async () => {
+            setBusy(true);
+            const res = await pwReveal(ciphertext, state.adminPassword, adminPw);
+            setBusy(false);
+            if (res.ok) { setRevealed(res.plaintext); setAsking(false); setAdminPw(''); setError(''); }
+            else setError('Λάθος κωδικός');
+          }}
+          style={smallBtn(ACCENT)}
+        >
+          OK
+        </button>
+        {error && <span style={{ color: RED, fontSize: 11 }}>{error}</span>}
+      </div>
+    );
+  }
+
+  return (
+    <button onClick={() => setAsking(true)} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer', display: 'flex', padding: 2 }} title="Εμφάνιση (απαιτεί τον δικό σου κωδικό)">
+      <Eye size={16} />
+    </button>
+  );
+}
+
 function AdminAccountModal({ state, persist, onClose }) {
   const [currentPassword, setCurrentPassword] = useState('');
   const [newUsername, setNewUsername] = useState(state.adminUsername);
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [error, setError] = useState('');
-  const [showCurrentPw, setShowCurrentPw] = useState(false);
+  const [busy, setBusy] = useState(false);
 
   const submit = async () => {
-    if (currentPassword !== state.adminPassword) { setError('Λάθος τρέχων κωδικός.'); return; }
+    setError('');
     if (!newUsername.trim()) { setError('Το όνομα χρήστη δεν μπορεί να είναι κενό.'); return; }
     if (newPassword && newPassword !== confirmPassword) { setError('Οι νέοι κωδικοί δεν ταιριάζουν.'); return; }
-    await persist({
-      ...state,
-      adminUsername: newUsername.trim(),
-      adminPassword: newPassword || state.adminPassword,
-    });
+    setBusy(true);
+    const ok = await pwVerify(state.adminPassword, currentPassword);
+    if (!ok) { setBusy(false); setError('Λάθος τρέχων κωδικός.'); return; }
+    const nextPassword = newPassword ? await pwEncrypt(newPassword) : state.adminPassword;
+    await persist({ ...state, adminUsername: newUsername.trim(), adminPassword: nextPassword });
+    setBusy(false);
     onClose();
   };
 
@@ -2104,14 +2196,7 @@ function AdminAccountModal({ state, persist, onClose }) {
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <span style={{ color: MUTE, fontSize: 13 }}>Κωδικός</span>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ color: TEXT, fontSize: 13, fontWeight: 600, fontFamily: 'monospace' }}>
-                {showCurrentPw ? state.adminPassword : '•'.repeat(state.adminPassword.length)}
-              </span>
-              <button onClick={() => setShowCurrentPw(v => !v)} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer', display: 'flex', padding: 2 }} title={showCurrentPw ? 'Απόκρυψη' : 'Εμφάνιση'}>
-                {showCurrentPw ? <EyeOff size={16} /> : <Eye size={16} />}
-              </button>
-            </div>
+            <RevealPasswordButton state={state} ciphertext={state.adminPassword} />
           </div>
         </div>
 
@@ -2128,23 +2213,28 @@ function AdminAccountModal({ state, persist, onClose }) {
         <input type="password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} style={input} />
 
         {error && <div style={{ color: RED, fontSize: 13, marginBottom: 12 }}>{error}</div>}
-        <button onClick={submit} style={{ ...btnPrimary, justifyContent: 'center' }}>Αποθήκευση</button>
+        <button onClick={submit} disabled={busy} style={{ ...btnPrimary, justifyContent: 'center', opacity: busy ? 0.6 : 1 }}>{busy ? 'Έλεγχος...' : 'Αποθήκευση'}</button>
       </div>
     </div>
   );
 }
 
-function DriverEditModal({ driver, cars, existingUsernames, onClose, onSave }) {
+function DriverEditModal({ state, driver, cars, existingUsernames, onClose, onSave }) {
   const [name, setName] = useState(driver?.name || '');
   const [username, setUsername] = useState(driver?.username || '');
-  const [password, setPassword] = useState(driver?.password || '');
+  const [password, setPassword] = useState('');
   const [car, setCar] = useState(driver?.car || cars[0]?.id || '');
   const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
 
-  const submit = () => {
-    if (!name || !username || !password || !car) { setError('Συμπλήρωσε όλα τα πεδία.'); return; }
+  const submit = async () => {
+    if (!name || !username || (!driver && !password) || !car) { setError('Συμπλήρωσε όλα τα πεδία.'); return; }
     if (existingUsernames.includes(username.trim().toLowerCase())) { setError('Το όνομα χρήστη υπάρχει ήδη.'); return; }
-    onSave({ id: driver?.id, name, username: username.trim().toLowerCase(), password, car });
+    setBusy(true);
+    const payload = { id: driver?.id, name, username: username.trim().toLowerCase(), car };
+    if (password) payload.password = await pwEncrypt(password); // omitted entirely when left blank on edit — keeps the existing one
+    setBusy(false);
+    onSave(payload);
   };
 
   return (
@@ -2158,14 +2248,22 @@ function DriverEditModal({ driver, cars, existingUsernames, onClose, onSave }) {
         <input value={name} onChange={e => setName(e.target.value)} style={input} />
         <label style={label}>Όνομα χρήστη</label>
         <input value={username} onChange={e => setUsername(e.target.value)} style={input} />
-        <label style={label}>Κωδικός</label>
+
+        {driver && (
+          <div style={{ background: CARD, borderRadius: 10, padding: 12, marginBottom: 16, border: `1px solid ${BORDER}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span style={{ color: MUTE, fontSize: 13 }}>Τρέχων κωδικός</span>
+            <RevealPasswordButton state={state} ciphertext={driver.password} />
+          </div>
+        )}
+
+        <label style={label}>{driver ? 'Νέος κωδικός (άφησέ το κενό για να μείνει ο ίδιος)' : 'Κωδικός'}</label>
         <input value={password} onChange={e => setPassword(e.target.value)} style={input} />
         <label style={label}>Όχημα</label>
         <select value={car} onChange={e => setCar(e.target.value)} style={input}>
           {cars.map(c => <option key={c.id} value={c.id}>{carLabel(c)}</option>)}
         </select>
         {error && <div style={{ color: RED, fontSize: 13, marginBottom: 12 }}>{error}</div>}
-        <button onClick={submit} style={{ ...btnPrimary, justifyContent: 'center' }}>Αποθήκευση</button>
+        <button onClick={submit} disabled={busy} style={{ ...btnPrimary, justifyContent: 'center', opacity: busy ? 0.6 : 1 }}>{busy ? 'Αποθήκευση...' : 'Αποθήκευση'}</button>
       </div>
     </div>
   );
