@@ -40,6 +40,7 @@ function hydrateState(raw) {
     reportsResetAt: raw.reportsResetAt !== undefined ? raw.reportsResetAt : initialState.reportsResetAt,
     adminUsername: raw.adminUsername || initialState.adminUsername,
     adminPassword: raw.adminPassword || initialState.adminPassword,
+    tameioAdjustments: raw.tameioAdjustments || initialState.tameioAdjustments,
   };
 }
 
@@ -80,12 +81,13 @@ const initialState = {
   ],
   shifts: [], // {id, driverId, car, date, startTime, endTime, startKm, endKm, startCash, cash, card, app, expenses, fuel, fuelReceiptPhoto, gpsStart, gpsEnd, status: 'active'|'closed'|'locked', notes}
   bookings: [], // driver-logged completed rides during a shift: {id, shiftId, driverId, flightNumber, arrivalTime, customerName, passengers, destination, price, paymentMethod:'cash'|'card'|'app', notes, status:'open'|'done'}
-  appointments: [], // admin-scheduled dispatch jobs: {id, date, time, durationMin, pickup, dropoff, customerName, driverId, car, status, notes,
+  appointments: [], // admin-scheduled dispatch jobs: {id, date, time, durationMin, pickup, dropoff, customerName, customerPhone, price, paymentMethod:'cash'|'card'|'prepaid', driverId, car, passengers, status, notes,
                      //   createdAt, assignedAt, acceptedAt, arrivedAt, completedAt}
   schedule: [], // weekly roster entries: {id, weekStart (Monday, ISO), driverId, day (0=Mon..6=Sun), slot: 'morning'|'night'|'rest', car}
   reportsResetAt: null, // ISO timestamp (date+time) — "Γενικό σύνολο" in Reports only counts shifts closed after this moment. Doesn't delete anything; monthly view always sees full history.
   adminUsername: 'admin',
   adminPassword: 'admin',
+  tameioAdjustments: [], // manual driver cash-float corrections: {id, driverId, amount (negative to subtract), reason, at (ISO)}
 };
 
 const fontStack = { fontFamily: 'Inter, system-ui, sans-serif' };
@@ -156,12 +158,17 @@ function carLabelById(state, carId) {
 
 // A driver's cash float ("ταμείο") carries over automatically from their last closed
 // shift's ending float — not the general turnover, just the physical cash they're
-// holding. New drivers (or ones with no prior closed shift) start at €0.
+// holding. New drivers (or ones with no prior closed shift) start at €0. Manual
+// adjustments (reset / subtract) made since that shift closed are added on top.
 function getDriverLastTameio(state, driverId) {
   const closed = state.shifts
     .filter(s => s.driverId === driverId && s.status !== 'active' && s.endTime)
     .sort((a, b) => new Date(b.endTime) - new Date(a.endTime));
-  return closed.length > 0 && closed[0].endTameio != null ? closed[0].endTameio : 0;
+  const baseline = closed.length > 0 && closed[0].endTameio != null ? closed[0].endTameio : 0;
+  const baselineAt = closed.length > 0 ? closed[0].endTime : null;
+  const adjustments = (state.tameioAdjustments || []).filter(a => a.driverId === driverId && (!baselineAt || a.at > baselineAt));
+  const adjustmentSum = adjustments.reduce((sum, a) => sum + (Number(a.amount) || 0), 0);
+  return baseline + adjustmentSum;
 }
 
 function getCarCurrentKm(state, carId) {
@@ -178,6 +185,40 @@ function getCarCurrentKm(state, carId) {
     if (s.startKm != null && s.startKm > max) max = s.startKm;
   }
   return max;
+}
+
+// When an admin-assigned appointment gets marked completed (by admin or driver), this
+// automatically logs it as a driver "ride" too — so it counts toward the shift's cash/card
+// totals just like a self-logged ride. Guards against double-logging via appointmentId.
+async function applyAppointmentPatch(state, persist, appointment, patch) {
+  let nextState = {
+    ...state,
+    appointments: state.appointments.map(a => a.id === appointment.id ? { ...a, ...patch } : a),
+  };
+  if (patch.status === 'completed' && Number(appointment.price) > 0) {
+    const alreadyLogged = state.bookings.some(b => b.appointmentId === appointment.id);
+    if (!alreadyLogged) {
+      const activeShift = state.shifts.find(s => s.driverId === appointment.driverId && s.status === 'active');
+      if (activeShift) {
+        const booking = {
+          id: 'bk_' + Date.now(),
+          shiftId: activeShift.id,
+          driverId: appointment.driverId,
+          appointmentId: appointment.id,
+          customerName: appointment.customerName,
+          destination: appointment.dropoff,
+          passengers: appointment.passengers || 1,
+          price: Number(appointment.price) || 0,
+          paymentMethod: appointment.paymentMethod || 'cash',
+          notes: 'Από ανάθεση διαχειριστή',
+          status: 'done',
+          createdAt: new Date().toISOString(),
+        };
+        nextState = { ...nextState, bookings: [...nextState.bookings, booking] };
+      }
+    }
+  }
+  await persist(nextState);
 }
 
 function checkAppointmentConflict({ appointments, shifts, cars }, { date, time, durationMin, driverId, car, excludeId }) {
@@ -487,13 +528,16 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
   const driver = state.drivers.find(d => d.id === driverId);
   const activeShift = state.shifts.find(s => s.driverId === driverId && s.status === 'active');
   const [screen, setScreen] = useState('home'); // home | startShift | booking | endShift | history
+  const [showTameioAdjust, setShowTameioAdjust] = useState(false);
 
   const myAppointmentsToday = state.appointments.filter(a =>
     a.driverId === driverId && a.date === isoDateStr(new Date()) && a.status !== 'completed' && a.status !== 'cancelled'
   );
 
   const updateApptStatus = async (id, patch) => {
-    await persist({ ...state, appointments: state.appointments.map(a => a.id === id ? { ...a, ...patch } : a) });
+    const appt = state.appointments.find(a => a.id === id);
+    if (!appt) return;
+    await applyAppointmentPatch(state, persist, appt, patch);
   };
 
   // Notifications for newly assigned appointments.
@@ -694,7 +738,10 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                       <div>
                         <div style={{ color: TEXT, fontSize: 14, fontWeight: 700 }}>{a.time} · {a.pickup} → {a.dropoff}</div>
-                        <div style={{ color: MUTE, fontSize: 12, marginTop: 2 }}>{a.customerName}{a.passengers ? ` · ${a.passengers} επιβ.` : ''}</div>
+                        <div style={{ color: MUTE, fontSize: 12, marginTop: 2 }}>
+                          {a.customerName}{a.passengers ? ` · ${a.passengers} επιβ.` : ''}
+                          {a.customerPhone && <> · <a href={`tel:${a.customerPhone}`} style={{ color: ACCENT }}>{a.customerPhone}</a></>}
+                        </div>
                       </div>
                       <span style={{ background: `${meta.color}22`, color: meta.color, padding: '3px 8px', borderRadius: 6, fontSize: 11, fontWeight: 600 }}>{meta.label}</span>
                     </div>
@@ -718,6 +765,17 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
               })}
             </div>
           </div>
+        )}
+
+        <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 16, padding: 16, marginBottom: 20, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div>
+            <div style={{ color: MUTE, fontSize: 12 }}>Τρέχον ταμείο (μετρητά)</div>
+            <div style={{ color: TEXT, fontSize: 20, fontWeight: 700 }}>{fmtEUR(getDriverLastTameio(state, driverId))}</div>
+          </div>
+          <button onClick={() => setShowTameioAdjust(true)} style={smallBtn(ACCENT)}>Διόρθωση</button>
+        </div>
+        {showTameioAdjust && (
+          <TameioAdjustModal state={state} persist={persist} driverId={driverId} onClose={() => setShowTameioAdjust(false)} />
         )}
 
         {activeShift ? (
@@ -1100,6 +1158,56 @@ function EndShiftScreen({ state, driver, shift, onBack, onSubmit }) {
       </button>
       <div style={{ color: MUTE, fontSize: 11, marginTop: 10, textAlign: 'center' }}>Μετά το κλείσιμο τα στοιχεία κλειδώνουν — αλλαγές μόνο με έγκριση διαχειριστή.</div>
     </Screen>
+  );
+}
+
+function TameioAdjustModal({ state, persist, driverId, onClose }) {
+  const current = getDriverLastTameio(state, driverId);
+  const [subtractAmount, setSubtractAmount] = useState('');
+  const [reason, setReason] = useState('');
+
+  const applyAdjustment = async (amount, defaultReason) => {
+    const entry = {
+      id: 'tadj_' + Date.now(),
+      driverId,
+      amount, // negative = subtraction
+      reason: reason.trim() || defaultReason,
+      at: new Date().toISOString(),
+    };
+    await persist({ ...state, tameioAdjustments: [...(state.tameioAdjustments || []), entry] });
+    onClose();
+  };
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: 20 }}>
+      <div style={{ background: BG, border: `1px solid ${BORDER}`, borderRadius: 16, padding: 24, width: '100%', maxWidth: 400 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+          <div style={{ color: TEXT, fontSize: 17, fontWeight: 700 }}>Διόρθωση ταμείου</div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer' }}><X size={20} /></button>
+        </div>
+        <div style={{ color: MUTE, fontSize: 13, marginBottom: 20 }}>Τρέχον ταμείο: <b style={{ color: TEXT }}>{fmtEUR(current)}</b></div>
+
+        <label style={label}>Αιτιολογία (προαιρετικό)</label>
+        <input value={reason} onChange={e => setReason(e.target.value)} style={input} placeholder="π.χ. Πληρωμή εταιρείας" />
+
+        <label style={label}>Αφαίρεση ποσού (€)</label>
+        <input type="number" value={subtractAmount} onChange={e => setSubtractAmount(e.target.value)} style={input} placeholder="π.χ. 20" />
+        <button
+          onClick={() => subtractAmount && applyAdjustment(-Math.abs(Number(subtractAmount)), 'Αφαίρεση ποσού')}
+          disabled={!subtractAmount}
+          style={{ ...btnPrimary, justifyContent: 'center', opacity: subtractAmount ? 1 : 0.5, cursor: subtractAmount ? 'pointer' : 'not-allowed', marginBottom: 12 }}
+        >
+          Αφαίρεση {subtractAmount ? fmtEUR(subtractAmount) : ''}
+        </button>
+
+        <button
+          onClick={() => applyAdjustment(-current, 'Μηδενισμός ταμείου')}
+          style={{ width: '100%', background: 'none', border: `1px solid ${RED}`, color: RED, borderRadius: 12, padding: 12, fontSize: 14, fontWeight: 700, cursor: 'pointer' }}
+        >
+          Μηδενισμός ταμείου
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -2017,12 +2125,15 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
   const [time, setTime] = useState(appointment?.time || defaultTime || '10:00');
   const [durationMin, setDurationMin] = useState(String(appointment?.durationMin || 60));
   const [customerName, setCustomerName] = useState(appointment?.customerName || '');
+  const [customerPhone, setCustomerPhone] = useState(appointment?.customerPhone || '');
   const [pickup, setPickup] = useState(appointment?.pickup || '');
   const [dropoff, setDropoff] = useState(appointment?.dropoff || '');
   const [driverId, setDriverId] = useState(appointment?.driverId || '');
   const [car, setCar] = useState(appointment?.car || '');
   const [notes, setNotes] = useState(appointment?.notes || '');
   const [passengers, setPassengers] = useState(appointment?.passengers || 1);
+  const [price, setPrice] = useState(appointment?.price != null ? String(appointment.price) : '');
+  const [paymentMethod, setPaymentMethod] = useState(appointment?.paymentMethod || 'cash');
   const [error, setError] = useState('');
 
   const conflict = useMemo(() => {
@@ -2046,8 +2157,8 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
         appointments: state.appointments.map(a => a.id === appointment.id ? {
           ...a,
           date, time, durationMin: Number(durationMin),
-          customerName, pickup, dropoff, driverId: driverId || null, car: car || null,
-          notes, passengers: Number(passengers),
+          customerName, customerPhone, pickup, dropoff, driverId: driverId || null, car: car || null,
+          notes, passengers: Number(passengers), price: price === '' ? null : Number(price), paymentMethod,
           status: wasUnassigned && nowAssigned ? 'assigned' : a.status,
           assignedAt: wasUnassigned && nowAssigned ? new Date().toISOString() : a.assignedAt,
         } : a),
@@ -2059,9 +2170,9 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
       const appt = {
         id: 'appt_' + Date.now(),
         date, time, durationMin: Number(durationMin),
-        customerName, pickup, dropoff, driverId: driverId || null, car: car || null,
+        customerName, customerPhone, pickup, dropoff, driverId: driverId || null, car: car || null,
         status: driverId || car ? 'assigned' : 'pending',
-        notes, passengers: Number(passengers),
+        notes, passengers: Number(passengers), price: price === '' ? null : Number(price), paymentMethod,
         createdAt: new Date().toISOString(),
         assignedAt: (driverId || car) ? new Date().toISOString() : null,
         acceptedAt: null, arrivedAt: null, completedAt: null,
@@ -2100,10 +2211,28 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
         <label style={label}>Όνομα πελάτη</label>
         <input value={customerName} onChange={e => setCustomerName(e.target.value)} style={input} placeholder="π.χ. Κος Αντωνίου" />
 
+        <label style={label}>Τηλέφωνο πελάτη (προαιρετικό)</label>
+        <input value={customerPhone} onChange={e => setCustomerPhone(e.target.value)} style={input} placeholder="π.χ. 6971234567" type="tel" />
+
         <label style={label}>Αριθμός επιβατών</label>
         <select value={passengers} onChange={e => setPassengers(e.target.value)} style={input}>
           {[1, 2, 3, 4, 5, 6, 7, 8].map(n => <option key={n} value={n}>{n}</option>)}
         </select>
+
+        <div style={{ display: 'flex', gap: 10 }}>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Τιμή (€, προαιρετικό)</label>
+            <input type="number" value={price} onChange={e => setPrice(e.target.value)} style={input} placeholder="π.χ. 35" />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Πληρωμή</label>
+            <select value={paymentMethod} onChange={e => setPaymentMethod(e.target.value)} style={input}>
+              <option value="cash">Μετρητά</option>
+              <option value="card">Κάρτα</option>
+              <option value="prepaid">Πληρωμένο</option>
+            </select>
+          </div>
+        </div>
 
         <div style={{ display: 'flex', gap: 10 }}>
           <div style={{ flex: 1 }}>
@@ -2333,7 +2462,9 @@ function AppointmentsHistoryTab({ state, persist }) {
     : null;
 
   const updateStatus = async (id, patch) => {
-    await persist({ ...state, appointments: state.appointments.map(a => a.id === id ? { ...a, ...patch } : a) });
+    const appt = state.appointments.find(a => a.id === id);
+    if (!appt) return;
+    await applyAppointmentPatch(state, persist, appt, patch);
   };
 
   return (
@@ -2383,7 +2514,11 @@ function AppointmentsHistoryTab({ state, persist }) {
                 <div>
                   <div style={{ color: TEXT, fontSize: 14, fontWeight: 700 }}>{dmy(a.date)} · {a.time}</div>
                   <div style={{ color: MUTE, fontSize: 13, marginTop: 2 }}>{a.pickup} → {a.dropoff}</div>
-                  <div style={{ color: MUTE, fontSize: 12, marginTop: 4 }}>{a.customerName}{a.passengers ? ` · ${a.passengers} επιβ.` : ''}</div>
+                  <div style={{ color: MUTE, fontSize: 12, marginTop: 4 }}>
+                    {a.customerName}{a.passengers ? ` · ${a.passengers} επιβ.` : ''}
+                    {a.customerPhone && <> · <a href={`tel:${a.customerPhone}`} style={{ color: ACCENT }}>{a.customerPhone}</a></>}
+                    {a.price != null && <> · {fmtEUR(a.price)} ({{ cash: 'Μετρητά', card: 'Κάρτα', prepaid: 'Πληρωμένο' }[a.paymentMethod || 'cash']})</>}
+                  </div>
                 </div>
                 <span style={{ background: `${meta.color}22`, color: meta.color, padding: '3px 8px', borderRadius: 6, fontSize: 11, fontWeight: 600 }}>{meta.label}</span>
               </div>
