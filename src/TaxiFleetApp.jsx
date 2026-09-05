@@ -41,6 +41,7 @@ function hydrateState(raw) {
     adminUsername: raw.adminUsername || initialState.adminUsername,
     adminPassword: raw.adminPassword || initialState.adminPassword,
     tameioAdjustments: raw.tameioAdjustments || initialState.tameioAdjustments,
+    auditLog: raw.auditLog || initialState.auditLog,
   };
 }
 
@@ -108,6 +109,7 @@ const initialState = {
   adminUsername: 'admin',
   adminPassword: 'admin',
   tameioAdjustments: [], // manual driver cash-float corrections: {id, driverId, amount (negative to subtract), reason, at (ISO)}
+  auditLog: [], // {id, at (ISO), actor, action} — who changed what, when. Capped at the most recent 500 entries.
 };
 
 const fontStack = { fontFamily: 'Inter, system-ui, sans-serif' };
@@ -210,11 +212,21 @@ function getCarCurrentKm(state, carId) {
 // When an admin-assigned appointment gets marked completed (by admin or driver), this
 // automatically logs it as a driver "ride" too — so it counts toward the shift's cash/card
 // totals just like a self-logged ride. Guards against double-logging via appointmentId.
-async function applyAppointmentPatch(state, persist, appointment, patch) {
+function withAuditEntry(state, actor, action) {
+  const entry = { id: 'log_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6), at: new Date().toISOString(), actor, action };
+  const auditLog = [...(state.auditLog || []), entry].slice(-500);
+  return { ...state, auditLog };
+}
+
+async function applyAppointmentPatch(state, persist, appointment, patch, actor) {
   let nextState = {
     ...state,
     appointments: state.appointments.map(a => a.id === appointment.id ? { ...a, ...patch } : a),
   };
+  if (patch.status) {
+    const label = (STATUS_META[patch.status] || {}).label || patch.status;
+    nextState = withAuditEntry(nextState, actor, `Άλλαξε την κατάσταση ανάθεσης "${appointment.customerName}" σε "${label}"`);
+  }
   if (patch.status === 'completed' && Number(appointment.price) > 0) {
     const alreadyLogged = state.bookings.some(b => b.appointmentId === appointment.id);
     if (!alreadyLogged) {
@@ -239,6 +251,22 @@ async function applyAppointmentPatch(state, persist, appointment, patch) {
     }
   }
   await persist(nextState);
+}
+
+// Free geocoding via OpenStreetMap's Nominatim (same source as the map tiles we already
+// use). Fine for our low volume (a handful of new appointment addresses per day) — not
+// meant for heavy/commercial use. Silently returns null on any failure.
+async function geocodeAddress(address) {
+  if (!address || !address.trim()) return null;
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(address + ', Θεσσαλονίκη')}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (data && data[0]) return { lat: Number(data[0].lat), lng: Number(data[0].lon) };
+  } catch (e) {
+    console.error('geocodeAddress failed (non-fatal):', e);
+  }
+  return null;
 }
 
 function checkAppointmentConflict({ appointments, shifts, cars }, { date, time, durationMin, driverId, car, excludeId }) {
@@ -606,11 +634,15 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
   const myAppointmentsToday = state.appointments.filter(a =>
     a.driverId === driverId && a.date === isoDateStr(new Date()) && a.status !== 'completed' && a.status !== 'cancelled'
   );
+  const myAppointmentsTomorrow = state.appointments.filter(a =>
+    a.driverId === driverId && a.date === addDaysIso(isoDateStr(new Date()), 1) && a.status !== 'completed' && a.status !== 'cancelled'
+  );
 
   const updateApptStatus = async (id, patch) => {
     const appt = state.appointments.find(a => a.id === id);
     if (!appt) return;
-    await applyAppointmentPatch(state, persist, appt, patch);
+    const driver = state.drivers.find(d => d.id === driverId);
+    await applyAppointmentPatch(state, persist, appt, patch, driver?.name || 'Οδηγός');
   };
 
   // Notifications for newly assigned appointments.
@@ -832,6 +864,31 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
                         <button onClick={() => updateApptStatus(a.id, { arrivedAt: new Date().toISOString() })} style={smallBtn(ACCENT)}>Άφιξη</button>
                       )}
                       <button onClick={() => updateApptStatus(a.id, { status: 'completed', completedAt: new Date().toISOString(), arrivedAt: a.arrivedAt || new Date().toISOString() })} style={smallBtn(GREEN)}>Ολοκλήρωση</button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {myAppointmentsTomorrow.length > 0 && (
+          <div style={{ marginBottom: 20 }}>
+            <div style={{ color: TEXT, fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Αναθέσεις αύριο</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {myAppointmentsTomorrow.map(a => {
+                const meta = STATUS_META[a.status] || STATUS_META.pending;
+                return (
+                  <div key={a.id} style={{ background: CARD, borderRadius: 12, padding: 14, border: `1px dashed ${BORDER}` }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                      <div>
+                        <div style={{ color: TEXT, fontSize: 14, fontWeight: 700 }}>{a.time} · {a.pickup} → {a.dropoff}</div>
+                        <div style={{ color: MUTE, fontSize: 12, marginTop: 2 }}>
+                          {a.customerName}{a.passengers ? ` · ${a.passengers} επιβ.` : ''}
+                          {a.customerPhone && <> · <a href={`tel:${a.customerPhone}`} style={{ color: ACCENT }}>{a.customerPhone}</a></>}
+                        </div>
+                      </div>
+                      <span style={{ background: `${meta.color}22`, color: meta.color, padding: '3px 8px', borderRadius: 6, fontSize: 11, fontWeight: 600 }}>{meta.label}</span>
                     </div>
                   </div>
                 );
@@ -1505,6 +1562,7 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
           { id: 'reports', label: 'Αναφορές' },
           { id: 'fleet', label: 'Στόλος & Οδηγοί' },
           { id: 'maintenance', label: 'Service' },
+          { id: 'auditlog', label: 'Ιστορικό' },
         ].map(t => (
           <button key={t.id} onClick={() => setTab(t.id)} style={{
             background: tab === t.id ? ACCENT : 'transparent', color: tab === t.id ? BG : MUTE,
@@ -1534,6 +1592,7 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
             { id: 'reports', label: 'Αναφορές' },
             { id: 'fleet', label: 'Στόλος & Οδηγοί' },
             { id: 'maintenance', label: 'Service' },
+          { id: 'auditlog', label: 'Ιστορικό' },
           ];
           const activeMoreTab = moreTabs.find(t => t.id === tab);
           return (
@@ -1574,19 +1633,51 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
         {tab === 'reports' && <ReportsTab state={state} persist={persist} />}
         {tab === 'fleet' && <FleetTab state={state} persist={persist} />}
         {tab === 'maintenance' && <MaintenanceTab state={state} persist={persist} />}
+        {tab === 'auditlog' && <AuditLogTab state={state} />}
       </div>
     </div>
   );
 }
 
 // ---------- Χάρτης στόλου (ζωντανές θέσεις, OpenStreetMap — χωρίς κλειδί API) ----------
+function AuditLogTab({ state }) {
+  const entries = (state.auditLog || []).slice().reverse();
+  return (
+    <div>
+      <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Ιστορικό αλλαγών</div>
+      <div style={{ color: MUTE, fontSize: 12, marginBottom: 16 }}>Ποιος επεξεργάστηκε τι, και πότε — βάρδιες και αναθέσεις. Κρατάει τις τελευταίες 500 καταχωρίσεις.</div>
+      {entries.length === 0 ? (
+        <div style={{ color: MUTE, fontSize: 13 }}>Καμία καταγεγραμμένη αλλαγή ακόμα.</div>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {entries.map(e => (
+            <div key={e.id} style={{ background: CARD, borderRadius: 10, padding: 12, border: `1px solid ${BORDER}` }}>
+              <div style={{ color: TEXT, fontSize: 13 }}>{e.action}</div>
+              <div style={{ color: MUTE, fontSize: 11, marginTop: 4 }}>
+                {dmy(e.at.slice(0, 10))} {new Date(e.at).toLocaleTimeString('el-GR', { hour: '2-digit', minute: '2-digit', hour12: false })} · {e.actor}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function FleetMapTab({ state }) {
   const mapDivRef = useRef(null);
   const mapRef = useRef(null);
   const markersRef = useRef({});
+  const apptMarkersRef = useRef({});
 
   const activeShifts = state.shifts.filter(s => s.status === 'active' && s.currentLocation);
   const positionsKey = activeShifts.map(s => `${s.id}:${s.currentLocation.lat.toFixed(5)}:${s.currentLocation.lng.toFixed(5)}`).join('|');
+
+  const todayIso = isoDateStr(new Date());
+  const pendingAppts = state.appointments.filter(a =>
+    a.date === todayIso && ['pending', 'assigned', 'accepted', 'enroute'].includes(a.status) && a.pickupLat != null && a.pickupLng != null
+  );
+  const apptsKey = pendingAppts.map(a => `${a.id}:${a.pickupLat}:${a.pickupLng}:${a.status}`).join('|');
 
   useEffect(() => {
     if (!window.L || !mapDivRef.current || mapRef.current) return;
@@ -1619,13 +1710,37 @@ function FleetMapTab({ state }) {
     if (pts.length > 0) mapRef.current.fitBounds(pts, { maxZoom: 15, padding: [30, 30] });
   }, [positionsKey]);
 
+  useEffect(() => {
+    if (!mapRef.current || !window.L) return;
+    const liveIds = new Set(pendingAppts.map(a => a.id));
+    Object.keys(apptMarkersRef.current).forEach(id => {
+      if (!liveIds.has(id)) { mapRef.current.removeLayer(apptMarkersRef.current[id]); delete apptMarkersRef.current[id]; }
+    });
+    pendingAppts.forEach(a => {
+      const driver = state.drivers.find(d => d.id === a.driverId);
+      const meta = STATUS_META[a.status] || STATUS_META.pending;
+      const html = `✈ <b>${a.customerName}</b><br/>${a.time} · ${a.pickup}<br/>${driver ? driver.name : 'Χωρίς ανάθεση'}<br/><span style="color:${meta.color}">${meta.label}</span>`;
+      if (apptMarkersRef.current[a.id]) {
+        apptMarkersRef.current[a.id].setPopupContent(html);
+      } else {
+        apptMarkersRef.current[a.id] = window.L.circleMarker([a.pickupLat, a.pickupLng], {
+          radius: 9, color: '#F5B942', weight: 2, fillColor: '#F5B942', fillOpacity: 0.85,
+        }).addTo(mapRef.current).bindPopup(html);
+      }
+    });
+  }, [apptsKey]);
+
   return (
     <div>
       <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Χάρτης στόλου (ζωντανά)</div>
-      <div style={{ color: MUTE, fontSize: 12, marginBottom: 12 }}>Η θέση ενημερώνεται μόνο όσο ο οδηγός έχει ανοιχτή την εφαρμογή στο κινητό του.</div>
-      {activeShifts.length === 0 && (
+      <div style={{ color: MUTE, fontSize: 12, marginBottom: 4 }}>Η θέση ενημερώνεται μόνο όσο ο οδηγός έχει ανοιχτή την εφαρμογή στο κινητό του.</div>
+      <div style={{ display: 'flex', gap: 14, marginBottom: 12, flexWrap: 'wrap' }}>
+        <Legend color="#3388ff" label="Όχημα σε βάρδια" />
+        <Legend color="#F5B942" label="Σημείο παραλαβής ραντεβού" />
+      </div>
+      {activeShifts.length === 0 && pendingAppts.length === 0 && (
         <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 12, padding: 16, color: MUTE, fontSize: 13, marginBottom: 12 }}>
-          Κανένα ενεργό όχημα αυτή τη στιγμή.
+          Κανένα ενεργό όχημα ή εκκρεμές ραντεβού αυτή τη στιγμή.
         </div>
       )}
       <div ref={mapDivRef} style={{ width: '100%', height: 440, borderRadius: 12, overflow: 'hidden', border: `1px solid ${BORDER}` }} />
@@ -2369,7 +2484,7 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
     if (isEdit) {
       const wasUnassigned = !appointment.driverId && !appointment.car;
       const nowAssigned = !!(driverId || car);
-      await persist({
+      let next = {
         ...state,
         appointments: state.appointments.map(a => a.id === appointment.id ? {
           ...a,
@@ -2379,9 +2494,16 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
           status: wasUnassigned && nowAssigned ? 'assigned' : a.status,
           assignedAt: wasUnassigned && nowAssigned ? new Date().toISOString() : a.assignedAt,
         } : a),
-      });
+      };
+      next = withAuditEntry(next, state.adminUsername, `Επεξεργάστηκε την ανάθεση "${customerName}"`);
+      await persist(next);
       if (wasUnassigned && nowAssigned && driverId) {
         sendPushToDriver(driverId, 'Νέο ραντεβού', `${time} · ${pickup} → ${dropoff}`, appointment.id);
+      }
+      if (pickup && pickup !== appointment.pickup) {
+        geocodeAddress(pickup).then(coords => {
+          if (coords) persist({ ...state, appointments: state.appointments.map(a => a.id === appointment.id ? { ...a, pickupLat: coords.lat, pickupLng: coords.lng } : a) });
+        });
       }
     } else {
       const appt = {
@@ -2397,6 +2519,11 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
       await persist({ ...state, appointments: [...state.appointments, appt] });
       if (driverId) {
         sendPushToDriver(driverId, 'Νέο ραντεβού', `${time} · ${pickup} → ${dropoff}`, appt.id);
+      }
+      if (pickup) {
+        geocodeAddress(pickup).then(coords => {
+          if (coords) persist({ ...state, appointments: [...state.appointments, appt].map(a => a.id === appt.id ? { ...a, pickupLat: coords.lat, pickupLng: coords.lng } : a) });
+        });
       }
     }
     onClose();
@@ -2681,7 +2808,7 @@ function AppointmentsHistoryTab({ state, persist }) {
   const updateStatus = async (id, patch) => {
     const appt = state.appointments.find(a => a.id === id);
     if (!appt) return;
-    await applyAppointmentPatch(state, persist, appt, patch);
+    await applyAppointmentPatch(state, persist, appt, patch, state.adminUsername);
   };
 
   return (
@@ -2930,7 +3057,8 @@ function EditShiftModal({ state, persist, shift, onClose }) {
   const [notes, setNotes] = useState(shift.notes || '');
 
   const save = async () => {
-    await persist({
+    const driver = state.drivers.find(d => d.id === shift.driverId);
+    let next = {
       ...state,
       shifts: state.shifts.map(s => s.id === shift.id ? {
         ...s,
@@ -2944,7 +3072,9 @@ function EditShiftModal({ state, persist, shift, onClose }) {
         fuel: fuel === '' ? null : Number(fuel),
         notes,
       } : s),
-    });
+    };
+    next = withAuditEntry(next, state.adminUsername, `Επεξεργάστηκε τη βάρδια του/της ${driver?.name || '—'} (${shift.date})`);
+    await persist(next);
     onClose();
   };
 
@@ -3143,6 +3273,37 @@ function computeReportStats(state, shifts) {
   return { byDriver, byCar, totalRevenue, totalExpenses, totalFuel, netProfit: totalRevenue - totalExpenses - totalFuel };
 }
 
+function exportShiftsCSV(shifts, state, filename) {
+  const header = ['Ημερομηνία', 'Οδηγός', 'Όχημα', 'Χλμ', 'Μετρητά', 'Κάρτες', 'App', 'Έξοδα', 'Πετρέλαιο', 'Τζίρος', 'Καθαρό', 'Διαδρομές'];
+  const rows = shifts.map(s => {
+    const driver = state.drivers.find(d => d.id === s.driverId);
+    const revenue = (s.cash || 0) + (s.card || 0) + (s.app || 0);
+    const net = revenue - (s.expenses || 0) - (s.fuel || 0);
+    const bookingsCount = state.bookings.filter(b => b.shiftId === s.id).length;
+    return [
+      s.date, driver?.name || '', carLabelById(state, s.car),
+      s.endKm ? s.endKm - s.startKm : '',
+      (s.cash || 0).toFixed(2), (s.card || 0).toFixed(2), (s.app || 0).toFixed(2),
+      (s.expenses || 0).toFixed(2), (s.fuel || 0).toFixed(2),
+      revenue.toFixed(2), net.toFixed(2), bookingsCount,
+    ];
+  });
+  const escapeCsv = (v) => {
+    const str = String(v);
+    return /[",\n;]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
+  };
+  const csv = '\uFEFF' + [header, ...rows].map(r => r.map(escapeCsv).join(';')).join('\r\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 function ReportsTab({ state, persist }) {
   const [view, setView] = useState('total'); // 'total' | 'month'
   const [month, setMonth] = useState(isoDateStr(new Date()).slice(0, 7)); // "YYYY-MM"
@@ -3193,15 +3354,19 @@ function ReportsTab({ state, persist }) {
               : 'Μετράει όλο το ιστορικό'}
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
+            <button onClick={() => exportShiftsCSV(totalShifts, state, `aναφορά-σύνολο-${isoDateStr(new Date())}.csv`)} style={smallBtn(GREEN)}>Εξαγωγή CSV</button>
             {state.reportsResetAt && <button onClick={clearReset} style={smallBtn(MUTE)}>Εμφάνιση όλων</button>}
             <button onClick={resetStats} style={smallBtn(RED)}>Μηδενισμός στατιστικών</button>
           </div>
         </div>
       ) : (
         <div style={{ marginBottom: 16 }}>
-          <select value={month} onChange={e => setMonth(e.target.value)} style={{ ...input, marginBottom: 0, width: 200 }}>
-            {monthOptions.map(ym => <option key={ym} value={ym}>{monthLabel(ym)}</option>)}
-          </select>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <select value={month} onChange={e => setMonth(e.target.value)} style={{ ...input, marginBottom: 0, width: 200 }}>
+              {monthOptions.map(ym => <option key={ym} value={ym}>{monthLabel(ym)}</option>)}
+            </select>
+            <button onClick={() => exportShiftsCSV(monthShifts, state, `aναφορά-${month}.csv`)} style={smallBtn(GREEN)}>Εξαγωγή CSV</button>
+          </div>
           <div style={{ color: MUTE, fontSize: 12, marginTop: 6 }}>Πλήρες ιστορικό — δεν επηρεάζεται από μηδενισμό. Διαθέσιμο για τους τελευταίους 12 μήνες.</div>
         </div>
       )}
