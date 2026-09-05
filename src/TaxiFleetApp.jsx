@@ -10,6 +10,15 @@ const SUPABASE_URL = 'https://whecwstuqlyohbvuvfkp.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_ZhFFRNTKncvML6BBK_j2pA_opwKSVGA';
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const ROW_ID = 'main'; // single shared state row
+const VAPID_PUBLIC_KEY = 'BKn1btEuoRmHeZAA2jfdHvNphTRjT2wuGKCudYv0KIOTMs_Jtq3T00wc7XjUSJBngMEVxPoTvfdVZYUjhk7Yc1I';
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; i++) outputArray[i] = rawData.charCodeAt(i);
+  return outputArray;
+}
 const POLL_MS = 8000; // how often other devices' changes get picked up
 
 const KEY = 'taxifleet:state:v3'; // fallback localStorage key, used only if cloud is unreachable
@@ -30,6 +39,19 @@ function hydrateState(raw) {
     schedule: raw.schedule || initialState.schedule,
     reportsResetAt: raw.reportsResetAt !== undefined ? raw.reportsResetAt : initialState.reportsResetAt,
   };
+}
+
+const SEND_PUSH_URL = `${SUPABASE_URL}/functions/v1/send-push`;
+async function sendPushToDriver(driverId, title, body, tag) {
+  try {
+    await fetch(SEND_PUSH_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ driverId, title, body, tag }),
+    });
+  } catch (e) {
+    console.error('sendPushToDriver failed (non-fatal):', e);
+  }
 }
 
 async function uploadFuelReceipt(file) {
@@ -463,12 +485,35 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
     await persist({ ...state, appointments: state.appointments.map(a => a.id === id ? { ...a, ...patch } : a) });
   };
 
-  // Notifications for newly assigned appointments — works while the app is open or
-  // backgrounded (screen locked, switched to another app), NOT if fully force-closed;
-  // that would need a real push-notification backend, a separate project.
+  // Notifications for newly assigned appointments.
+  // Two layers: (1) a real push subscription — delivered by the OS even if the app is
+  // fully closed, via the service worker's 'push' handler; (2) a local fallback below
+  // that fires instantly whenever the app happens to be open and polling.
   const [notifPermission, setNotifPermission] = useState(
     typeof Notification !== 'undefined' ? Notification.permission : 'unsupported'
   );
+
+  const subscribeToPush = useCallback(async () => {
+    try {
+      if (!navigator.serviceWorker || !('PushManager' in window)) return;
+      const reg = await navigator.serviceWorker.ready;
+      let sub = await reg.pushManager.getSubscription();
+      if (!sub) {
+        sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+        });
+      }
+      await supabase.from('push_subscriptions').upsert({ id: driverId, driver_id: driverId, subscription: sub.toJSON() });
+    } catch (e) {
+      console.error('Push subscribe failed:', e);
+    }
+  }, [driverId]);
+
+  useEffect(() => {
+    if (notifPermission === 'granted') subscribeToPush();
+  }, [notifPermission, subscribeToPush]);
+
   const requestNotifPermission = () => {
     if (typeof Notification === 'undefined') return;
     Notification.requestPermission().then(setNotifPermission);
@@ -1798,6 +1843,9 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
           assignedAt: wasUnassigned && nowAssigned ? new Date().toISOString() : a.assignedAt,
         } : a),
       });
+      if (wasUnassigned && nowAssigned && driverId) {
+        sendPushToDriver(driverId, 'Νέο ραντεβού', `${time} · ${pickup} → ${dropoff}`, appointment.id);
+      }
     } else {
       const appt = {
         id: 'appt_' + Date.now(),
@@ -1810,6 +1858,9 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
         acceptedAt: null, arrivedAt: null, completedAt: null,
       };
       await persist({ ...state, appointments: [...state.appointments, appt] });
+      if (driverId) {
+        sendPushToDriver(driverId, 'Νέο ραντεβού', `${time} · ${pickup} → ${dropoff}`, appt.id);
+      }
     }
     onClose();
   };
