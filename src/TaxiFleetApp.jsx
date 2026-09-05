@@ -2097,6 +2097,7 @@ function FleetTab({ state, persist }) {
       {editingDriver && (
         <DriverEditModal
           state={state}
+          persist={persist}
           driver={editingDriver === 'new' ? null : editingDriver}
           cars={state.cars}
           existingUsernames={state.drivers.filter(d => d.id !== (editingDriver?.id)).map(d => d.username)}
@@ -2108,7 +2109,7 @@ function FleetTab({ state, persist }) {
   );
 }
 
-function RevealPasswordButton({ state, ciphertext }) {
+function RevealPasswordButton({ state, persist, ciphertext }) {
   const [revealed, setRevealed] = useState(null); // plaintext string, or null
   const [asking, setAsking] = useState(false);
   const [adminPw, setAdminPw] = useState('');
@@ -2140,8 +2141,22 @@ function RevealPasswordButton({ state, ciphertext }) {
             setBusy(true);
             const res = await pwReveal(ciphertext, state.adminPassword, adminPw);
             setBusy(false);
-            if (res.ok) { setRevealed(res.plaintext); setAsking(false); setAdminPw(''); setError(''); }
-            else setError('Λάθος κωδικός');
+            if (res.ok) {
+              setRevealed(res.plaintext);
+              setAsking(false);
+              setAdminPw('');
+              setError('');
+              // Opportunistic self-heal: now that we know this password is correct,
+              // make sure it's actually stored encrypted (covers accounts still logged
+              // in from before this feature existed, who never re-logged-in to migrate).
+              if (persist) {
+                pwEncrypt(adminPw).then(ciphertextNow => {
+                  persist({ ...state, adminPassword: ciphertextNow });
+                });
+              }
+            } else {
+              setError('Λάθος κωδικός');
+            }
           }}
           style={smallBtn(ACCENT)}
         >
@@ -2196,7 +2211,7 @@ function AdminAccountModal({ state, persist, onClose }) {
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <span style={{ color: MUTE, fontSize: 13 }}>Κωδικός</span>
-            <RevealPasswordButton state={state} ciphertext={state.adminPassword} />
+            <RevealPasswordButton state={state} persist={persist} ciphertext={state.adminPassword} />
           </div>
         </div>
 
@@ -2219,7 +2234,7 @@ function AdminAccountModal({ state, persist, onClose }) {
   );
 }
 
-function DriverEditModal({ state, driver, cars, existingUsernames, onClose, onSave }) {
+function DriverEditModal({ state, persist, driver, cars, existingUsernames, onClose, onSave }) {
   const [name, setName] = useState(driver?.name || '');
   const [username, setUsername] = useState(driver?.username || '');
   const [password, setPassword] = useState('');
@@ -2252,7 +2267,7 @@ function DriverEditModal({ state, driver, cars, existingUsernames, onClose, onSa
         {driver && (
           <div style={{ background: CARD, borderRadius: 10, padding: 12, marginBottom: 16, border: `1px solid ${BORDER}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <span style={{ color: MUTE, fontSize: 13 }}>Τρέχων κωδικός</span>
-            <RevealPasswordButton state={state} ciphertext={driver.password} />
+            <RevealPasswordButton state={state} persist={persist} ciphertext={driver.password} />
           </div>
         )}
 
