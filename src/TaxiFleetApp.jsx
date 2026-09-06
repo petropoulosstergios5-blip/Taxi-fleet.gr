@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { createClient } from '@supabase/supabase-js';
-import { Car, Clock, MapPin, Fuel, AlertCircle, CheckCircle2, Plus, X, ChevronRight, Navigation, Calendar, User, LogOut, Gauge, Wallet, ArrowLeft, Lock, Camera, CreditCard, Banknote, Smartphone, Plane, Users, Unlock, Filter, XCircle, PlayCircle, Flag, Eye, EyeOff } from 'lucide-react';
+import { Car, Clock, MapPin, Fuel, AlertCircle, CheckCircle2, Plus, X, ChevronRight, Navigation, Calendar, User, LogOut, Gauge, Wallet, ArrowLeft, Lock, Camera, CreditCard, Banknote, Smartphone, Plane, Users, Unlock, Filter, XCircle, PlayCircle, Flag, Eye, EyeOff, MessageCircle } from 'lucide-react';
 
 // --- Supabase (cloud sync) ---
 // Publishable/anon keys are meant to be embedded in client code — that's how Supabase works.
@@ -42,6 +42,7 @@ function hydrateState(raw) {
     adminPassword: raw.adminPassword || initialState.adminPassword,
     tameioAdjustments: raw.tameioAdjustments || initialState.tameioAdjustments,
     auditLog: raw.auditLog || initialState.auditLog,
+    messages: raw.messages || initialState.messages,
   };
 }
 
@@ -110,6 +111,7 @@ const initialState = {
   adminPassword: 'admin',
   tameioAdjustments: [], // manual driver cash-float corrections: {id, driverId, amount (negative to subtract), reason, at (ISO)}
   auditLog: [], // {id, at (ISO), actor, action} — who changed what, when. Capped at the most recent 500 entries.
+  messages: [], // 1:1 chat threads between admin and each driver: {id, driverId, sender:'admin'|'driver', text, at, readByAdmin, readByDriver}
 };
 
 const fontStack = { fontFamily: 'Inter, system-ui, sans-serif' };
@@ -791,6 +793,11 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
   if (screen === 'endShift') return <EndShiftScreen state={state} driver={driver} shift={activeShift} onBack={() => setScreen('home')} onSubmit={closeShift} />;
   if (screen === 'history') return <HistoryScreen state={state} driverId={driverId} onBack={() => setScreen('home')} />;
   if (screen === 'schedule') return <MyScheduleScreen state={state} driverId={driverId} onBack={() => setScreen('home')} />;
+  if (screen === 'chat') return (
+    <Screen title="Μηνύματα" subtitle="Διαχειριστής" onBack={() => setScreen('home')}>
+      <ChatThread state={state} persist={persist} driverId={driverId} viewerRole="driver" />
+    </Screen>
+  );
 
   return (
     <div style={{ minHeight: '100vh', background: BG, ...fontStack }}>
@@ -952,6 +959,12 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
             icon={Calendar}
             onClick={() => setScreen('schedule')}
           />
+          <BigButton
+            label="Μηνύματα"
+            icon={MessageCircle}
+            onClick={() => setScreen('chat')}
+            badge={state.messages.filter(m => m.driverId === driverId && m.sender === 'admin' && !m.readByDriver).length}
+          />
           {activeShift && (
             <button onClick={() => setScreen('endShift')} style={{ ...btnPrimary, background: RED, color: '#fff', marginTop: 8 }}>
               <span>Κλείσιμο Βάρδιας</span>
@@ -964,7 +977,7 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
   );
 }
 
-function BigButton({ label, icon: Icon, onClick, disabled }) {
+function BigButton({ label, icon: Icon, onClick, disabled, badge }) {
   return (
     <button
       onClick={disabled ? undefined : onClick}
@@ -980,7 +993,12 @@ function BigButton({ label, icon: Icon, onClick, disabled }) {
         <Icon size={20} color={disabled ? MUTE : ACCENT} />
       </div>
       <span style={{ color: TEXT, fontSize: 16, fontWeight: 700 }}>{label}</span>
-      <ChevronRight size={18} color={MUTE} style={{ marginLeft: 'auto' }} />
+      <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+        {badge > 0 && (
+          <span style={{ background: RED, color: '#fff', borderRadius: 999, minWidth: 20, height: 20, fontSize: 11, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0 5px' }}>{badge}</span>
+        )}
+        <ChevronRight size={18} color={MUTE} />
+      </div>
     </button>
   );
 }
@@ -1521,6 +1539,7 @@ function Screen({ title, subtitle, onBack, children }) {
 function AdminApp({ state, persist, onLogout, cloudStatus }) {
   const [tab, setTab] = useState('overview');
   const [moreOpen, setMoreOpen] = useState(false);
+  const adminUnreadCount = state.messages.filter(m => m.sender === 'driver' && !m.readByAdmin).length;
 
   const lockShift = async (shiftId) => {
     await persist({ ...state, shifts: state.shifts.map(s => s.id === shiftId ? { ...s, status: 'locked' } : s) });
@@ -1563,11 +1582,18 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
           { id: 'fleet', label: 'Στόλος & Οδηγοί' },
           { id: 'maintenance', label: 'Service' },
           { id: 'auditlog', label: 'Ιστορικό' },
+          { id: 'messages', label: 'Μηνύματα' },
         ].map(t => (
           <button key={t.id} onClick={() => setTab(t.id)} style={{
             background: tab === t.id ? ACCENT : 'transparent', color: tab === t.id ? BG : MUTE,
             border: 'none', borderRadius: 8, padding: '9px 14px', fontSize: 13, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap',
-          }}>{t.label}</button>
+            position: 'relative',
+          }}>
+            {t.label}
+            {t.id === 'messages' && adminUnreadCount > 0 && (
+              <span style={{ position: 'absolute', top: -4, right: -4, background: RED, color: '#fff', borderRadius: 999, minWidth: 16, height: 16, fontSize: 10, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0 3px' }}>{adminUnreadCount}</span>
+            )}
+          </button>
         ))}
       </div>
 
@@ -1593,6 +1619,7 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
             { id: 'fleet', label: 'Στόλος & Οδηγοί' },
             { id: 'maintenance', label: 'Service' },
           { id: 'auditlog', label: 'Ιστορικό' },
+          { id: 'messages', label: 'Μηνύματα' },
           ];
           const activeMoreTab = moreTabs.find(t => t.id === tab);
           return (
@@ -1600,9 +1627,12 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
               <button onClick={() => setMoreOpen(v => !v)} style={{
                 background: activeMoreTab ? ACCENT : 'transparent', color: activeMoreTab ? BG : MUTE,
                 border: `1px solid ${activeMoreTab ? ACCENT : BORDER}`, borderRadius: 8, padding: '9px 14px', fontSize: 13, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap',
-                display: 'flex', alignItems: 'center', gap: 6,
+                display: 'flex', alignItems: 'center', gap: 6, position: 'relative',
               }}>
                 {activeMoreTab ? activeMoreTab.label : 'Περισσότερα'} <ChevronRight size={14} style={{ transform: moreOpen ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.15s' }} />
+                {adminUnreadCount > 0 && (
+                  <span style={{ position: 'absolute', top: -4, right: -4, background: RED, color: '#fff', borderRadius: 999, minWidth: 16, height: 16, fontSize: 10, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0 3px' }}>{adminUnreadCount}</span>
+                )}
               </button>
               {moreOpen && (
                 <>
@@ -1634,12 +1664,137 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
         {tab === 'fleet' && <FleetTab state={state} persist={persist} />}
         {tab === 'maintenance' && <MaintenanceTab state={state} persist={persist} />}
         {tab === 'auditlog' && <AuditLogTab state={state} />}
+        {tab === 'messages' && <MessagesTab state={state} persist={persist} />}
       </div>
     </div>
   );
 }
 
 // ---------- Χάρτης στόλου (ζωντανές θέσεις, OpenStreetMap — χωρίς κλειδί API) ----------
+function ChatThread({ state, persist, driverId, viewerRole, onBack }) {
+  const [text, setText] = useState('');
+  const bottomRef = useRef(null);
+  const messages = state.messages.filter(m => m.driverId === driverId).slice().sort((a, b) => new Date(a.at) - new Date(b.at));
+  const driver = state.drivers.find(d => d.id === driverId);
+
+  useEffect(() => {
+    const readField = viewerRole === 'admin' ? 'readByAdmin' : 'readByDriver';
+    const unread = messages.filter(m => m.sender !== viewerRole && !m[readField]);
+    if (unread.length > 0) {
+      const unreadIds = new Set(unread.map(m => m.id));
+      persist({ ...state, messages: state.messages.map(m => unreadIds.has(m.id) ? { ...m, [readField]: true } : m) });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages.length]);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ block: 'end' });
+  }, [messages.length]);
+
+  const send = async () => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const msg = {
+      id: 'msg_' + Date.now(), driverId, sender: viewerRole, text: trimmed, at: new Date().toISOString(),
+      readByAdmin: viewerRole === 'admin', readByDriver: viewerRole === 'driver',
+    };
+    setText('');
+    await persist({ ...state, messages: [...state.messages, msg] });
+    if (viewerRole === 'admin') sendPushToDriver(driverId, `Μήνυμα από τον διαχειριστή`, trimmed, msg.id);
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      {onBack && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+          <button onClick={onBack} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer', display: 'flex' }}><ArrowLeft size={20} /></button>
+          <div style={{ color: TEXT, fontSize: 15, fontWeight: 700 }}>{viewerRole === 'admin' ? (driver?.name || 'Οδηγός') : 'Διαχειριστής'}</div>
+        </div>
+      )}
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 8, overflowY: 'auto', minHeight: 240, maxHeight: 480, padding: '4px 2px' }}>
+        {messages.length === 0 && <div style={{ color: MUTE, fontSize: 13, textAlign: 'center', marginTop: 20 }}>Καμία συνομιλία ακόμα — γράψε το πρώτο μήνυμα.</div>}
+        {messages.map(m => {
+          const mine = m.sender === viewerRole;
+          return (
+            <div key={m.id} style={{ alignSelf: mine ? 'flex-end' : 'flex-start', maxWidth: '78%' }}>
+              <div style={{
+                background: mine ? ACCENT : CARD, color: mine ? BG : TEXT,
+                border: mine ? 'none' : `1px solid ${BORDER}`, borderRadius: 14,
+                borderBottomRightRadius: mine ? 4 : 14, borderBottomLeftRadius: mine ? 14 : 4,
+                padding: '9px 13px', fontSize: 14, wordBreak: 'break-word',
+              }}>
+                {m.text}
+              </div>
+              <div style={{ color: MUTE, fontSize: 10, marginTop: 3, textAlign: mine ? 'right' : 'left' }}>
+                {new Date(m.at).toLocaleTimeString('el-GR', { hour: '2-digit', minute: '2-digit', hour12: false })}
+              </div>
+            </div>
+          );
+        })}
+        <div ref={bottomRef} />
+      </div>
+      <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+        <input
+          value={text} onChange={e => setText(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && send()}
+          placeholder="Γράψε μήνυμα..." style={{ ...input, marginBottom: 0, flex: 1 }}
+        />
+        <button onClick={send} disabled={!text.trim()} style={{ ...btnPrimary, width: 'auto', padding: '0 18px', opacity: text.trim() ? 1 : 0.5, cursor: text.trim() ? 'pointer' : 'not-allowed' }}>Αποστολή</button>
+      </div>
+    </div>
+  );
+}
+
+function MessagesTab({ state, persist }) {
+  const [openDriverId, setOpenDriverId] = useState(null);
+
+  if (openDriverId) {
+    return (
+      <div style={{ maxWidth: 480 }}>
+        <ChatThread state={state} persist={persist} driverId={openDriverId} viewerRole="admin" onBack={() => setOpenDriverId(null)} />
+      </div>
+    );
+  }
+
+  const rows = state.drivers.map(d => {
+    const msgs = state.messages.filter(m => m.driverId === d.id).sort((a, b) => new Date(b.at) - new Date(a.at));
+    const last = msgs[0];
+    const unread = msgs.filter(m => m.sender === 'driver' && !m.readByAdmin).length;
+    return { driver: d, last, unread };
+  }).sort((a, b) => {
+    if (!a.last && !b.last) return a.driver.name.localeCompare(b.driver.name);
+    if (!a.last) return 1;
+    if (!b.last) return -1;
+    return new Date(b.last.at) - new Date(a.last.at);
+  });
+
+  return (
+    <div>
+      <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Μηνύματα</div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {rows.map(({ driver, last, unread }) => (
+          <button key={driver.id} onClick={() => setOpenDriverId(driver.id)} style={{
+            textAlign: 'left', background: CARD, border: `1px solid ${unread ? ACCENT : BORDER}`, borderRadius: 12,
+            padding: 14, cursor: 'pointer', font: 'inherit', color: 'inherit',
+            display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10,
+          }}>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ color: TEXT, fontSize: 14, fontWeight: 700 }}>{driver.name}</div>
+              <div style={{ color: MUTE, fontSize: 12, marginTop: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                {last ? `${last.sender === 'admin' ? 'Εσύ: ' : ''}${last.text}` : 'Καμία συνομιλία ακόμα'}
+              </div>
+            </div>
+            {unread > 0 && (
+              <span style={{ background: ACCENT, color: BG, borderRadius: 999, minWidth: 22, height: 22, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, fontWeight: 700, flexShrink: 0 }}>{unread}</span>
+            )}
+          </button>
+        ))}
+        {rows.length === 0 && <div style={{ color: MUTE, fontSize: 13 }}>Δεν υπάρχουν οδηγοί ακόμα.</div>}
+      </div>
+    </div>
+  );
+}
+
 function AuditLogTab({ state }) {
   const entries = (state.auditLog || []).slice().reverse();
   return (
