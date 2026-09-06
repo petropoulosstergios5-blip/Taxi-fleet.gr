@@ -703,6 +703,29 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
     try { localStorage.setItem(`taxifleet:notified:${driverId}`, JSON.stringify([...notifiedRef.current])); } catch (e) {}
   }, [state.appointments, driverId, notifPermission]);
 
+  // Same local fallback, for new chat messages from the admin — some devices (notably
+  // Huawei phones without Google Play services) don't reliably deliver real background
+  // push, so this makes sure a notification still shows up whenever the app is open and
+  // polling, even if the "silent" push to a locked/closed phone doesn't get through.
+  const notifiedMsgRef = useRef(new Set(
+    JSON.parse(localStorage.getItem(`taxifleet:notifiedmsg:${driverId}`) || '[]')
+  ));
+  useEffect(() => {
+    if (notifPermission !== 'granted') return;
+    const fromAdmin = state.messages.filter(m => m.driverId === driverId && m.sender === 'admin');
+    const newOnes = fromAdmin.filter(m => !notifiedMsgRef.current.has(m.id));
+    if (newOnes.length === 0) return;
+    newOnes.forEach(m => {
+      notifiedMsgRef.current.add(m.id);
+      if (navigator.serviceWorker) {
+        navigator.serviceWorker.ready.then(reg => {
+          reg.showNotification('Μήνυμα από τον διαχειριστή', { body: m.text, icon: '/icon-192.png', tag: m.id });
+        }).catch(() => {});
+      }
+    });
+    try { localStorage.setItem(`taxifleet:notifiedmsg:${driverId}`, JSON.stringify([...notifiedMsgRef.current])); } catch (e) {}
+  }, [state.messages, driverId, notifPermission]);
+
   // Live location — only while the app is open in the foreground and a shift is active.
   // A ref holds the latest state so the interval always writes on top of current data,
   // not a stale snapshot from when the effect first ran.
