@@ -43,6 +43,7 @@ function hydrateState(raw) {
     tameioAdjustments: raw.tameioAdjustments || initialState.tameioAdjustments,
     auditLog: raw.auditLog || initialState.auditLog,
     messages: raw.messages || initialState.messages,
+    fareSettings: raw.fareSettings || initialState.fareSettings,
   };
 }
 
@@ -112,6 +113,7 @@ const initialState = {
   tameioAdjustments: [], // manual driver cash-float corrections: {id, driverId, amount (negative to subtract), reason, at (ISO)}
   auditLog: [], // {id, at (ISO), actor, action} — who changed what, when. Capped at the most recent 500 entries.
   messages: [], // 1:1 chat threads between admin and each driver: {id, driverId, sender:'admin'|'driver', text, at, readByAdmin, readByDriver}
+  fareSettings: { flagFall: 1.90, perKm: 1.65, minFare: 3.50 }, // admin-configurable, used only as a starting suggestion
 };
 
 const fontStack = { fontFamily: 'Inter, system-ui, sans-serif' };
@@ -269,6 +271,31 @@ async function geocodeAddress(address) {
     console.error('geocodeAddress failed (non-fatal):', e);
   }
   return null;
+}
+
+// Estimates a fare: geocodes both addresses (free Nominatim), gets real driving distance
+// (free OSRM demo server — fine for our low volume, not for heavy commercial use), then
+// applies the admin's configured tariff. Returns {ok:false, reason} if anything fails —
+// never blocks the form, this is always just a starting suggestion.
+async function estimateFare(pickup, dropoff, fareSettings, knownFrom) {
+  const from = knownFrom || await geocodeAddress(pickup);
+  if (!from) return { ok: false, reason: 'Δεν βρέθηκε η διεύθυνση παραλαβής' };
+  const to = await geocodeAddress(dropoff);
+  if (!to) return { ok: false, reason: 'Δεν βρέθηκε ο προορισμός' };
+  try {
+    const url = `https://router.project-osrm.org/route/v1/driving/${from.lng},${from.lat};${to.lng},${to.lat}?overview=false`;
+    const res = await fetch(url);
+    const data = await res.json();
+    const meters = data?.routes?.[0]?.distance;
+    if (meters == null) return { ok: false, reason: 'Δεν βρέθηκε διαδρομή ανάμεσα στα δύο σημεία' };
+    const km = meters / 1000;
+    const raw = (fareSettings.flagFall || 0) + km * (fareSettings.perKm || 0);
+    const price = Math.max(raw, fareSettings.minFare || 0);
+    return { ok: true, km, price: Math.round(price * 100) / 100, from, to };
+  } catch (e) {
+    console.error('estimateFare routing failed:', e);
+    return { ok: false, reason: 'Η υπηρεσία διαδρομών δεν αποκρίθηκε' };
+  }
 }
 
 function checkAppointmentConflict({ appointments, shifts, cars }, { date, time, durationMin, driverId, car, excludeId }) {
@@ -1141,6 +1168,7 @@ function BookingScreen({ state, driver, shift, onBack, onSubmit }) {
   const [price, setPrice] = useState('');
   const [paymentMethod, setPaymentMethod] = useState('cash'); // 'cash' | 'card' | 'app'
   const [notes, setNotes] = useState('');
+  const [fareCalcStatus, setFareCalcStatus] = useState('');
 
   const canSubmit = customerName && destination && price;
   const PAY_OPTIONS = [
@@ -1148,6 +1176,19 @@ function BookingScreen({ state, driver, shift, onBack, onSubmit }) {
     { id: 'card', label: 'Κάρτα', icon: CreditCard },
     { id: 'app', label: 'App', icon: Smartphone },
   ];
+
+  const calcFare = async () => {
+    setFareCalcStatus('loading');
+    const here = await captureGPS();
+    if (!here) { setFareCalcStatus('✗ Δεν κατάφερα να πάρω τη θέση σου (GPS)'); return; }
+    const result = await estimateFare(null, destination, state.fareSettings || { flagFall: 1.9, perKm: 1.65, minFare: 3.5 }, here);
+    if (result.ok) {
+      setPrice(String(result.price));
+      setFareCalcStatus(`✓ ${result.km.toFixed(1)} χλμ από εδώ · προτεινόμενη τιμή €${result.price.toFixed(2)}`);
+    } else {
+      setFareCalcStatus(`✗ ${result.reason}`);
+    }
+  };
 
   return (
     <Screen title="Νέα Προμίσθωση" subtitle={carLabelById(state, shift?.car || driver.car)} onBack={onBack}>
@@ -1165,6 +1206,17 @@ function BookingScreen({ state, driver, shift, onBack, onSubmit }) {
 
       <label style={label}>Προορισμός</label>
       <input value={destination} onChange={e => setDestination(e.target.value)} placeholder="π.χ. Αεροδρόμιο" style={input} />
+
+      <button
+        onClick={calcFare}
+        disabled={!destination || fareCalcStatus === 'loading'}
+        style={{ ...smallBtn(ACCENT), width: '100%', marginBottom: 8, opacity: !destination ? 0.5 : 1, cursor: !destination ? 'not-allowed' : 'pointer' }}
+      >
+        {fareCalcStatus === 'loading' ? 'Υπολογισμός...' : '🧮 Υπολογισμός τιμής από τη θέση μου'}
+      </button>
+      {fareCalcStatus && fareCalcStatus !== 'loading' && (
+        <div style={{ color: fareCalcStatus.startsWith('✓') ? GREEN : RED, fontSize: 12, marginBottom: 12 }}>{fareCalcStatus}</div>
+      )}
 
       <label style={label}>Τιμή (€)</label>
       <input type="number" value={price} onChange={e => setPrice(e.target.value)} placeholder="π.χ. 35" style={input} />
@@ -2320,6 +2372,16 @@ function FleetTab({ state, persist }) {
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
   const [editingCar, setEditingCar] = useState(null); // car object being edited
   const [editingAdminAccount, setEditingAdminAccount] = useState(false);
+  const [flagFall, setFlagFall] = useState(String(state.fareSettings?.flagFall ?? 1.9));
+  const [perKm, setPerKm] = useState(String(state.fareSettings?.perKm ?? 1.65));
+  const [minFare, setMinFare] = useState(String(state.fareSettings?.minFare ?? 3.5));
+  const [fareSaved, setFareSaved] = useState(false);
+
+  const saveFareSettings = async () => {
+    await persist({ ...state, fareSettings: { flagFall: Number(flagFall) || 0, perKm: Number(perKm) || 0, minFare: Number(minFare) || 0 } });
+    setFareSaved(true);
+    setTimeout(() => setFareSaved(false), 2000);
+  };
 
   const activeShiftForCar = (carId) => state.shifts.find(s => s.car === carId && s.status === 'active');
 
@@ -2415,6 +2477,26 @@ function FleetTab({ state, persist }) {
         <button onClick={() => setEditingAdminAccount(true)} style={smallBtn(ACCENT)}>Επεξεργασία</button>
       </div>
       {editingAdminAccount && <AdminAccountModal state={state} persist={persist} onClose={() => setEditingAdminAccount(false)} />}
+
+      <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Ρυθμίσεις κοστολόγησης</div>
+      <div style={{ color: MUTE, fontSize: 12, marginBottom: 12 }}>Χρησιμοποιούνται μόνο για τον αυτόματο υπολογισμό προτεινόμενης τιμής διαδρομής — πάντα επεξεργάσιμη πριν αποθηκευτεί.</div>
+      <div style={{ background: CARD, borderRadius: 10, padding: 14, border: `1px solid ${BORDER}`, marginBottom: 24 }}>
+        <div style={{ display: 'flex', gap: 10, marginBottom: 10 }}>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Σημαία εκκίνησης (€)</label>
+            <input type="number" value={flagFall} onChange={e => setFlagFall(e.target.value)} style={{ ...input, marginBottom: 0 }} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Τιμή ανά χλμ (€)</label>
+            <input type="number" value={perKm} onChange={e => setPerKm(e.target.value)} style={{ ...input, marginBottom: 0 }} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Ελάχιστη χρέωση (€)</label>
+            <input type="number" value={minFare} onChange={e => setMinFare(e.target.value)} style={{ ...input, marginBottom: 0 }} />
+          </div>
+        </div>
+        <button onClick={saveFareSettings} style={smallBtn(fareSaved ? GREEN : ACCENT)}>{fareSaved ? '✓ Αποθηκεύτηκε' : 'Αποθήκευση'}</button>
+      </div>
 
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
         <div style={{ color: TEXT, fontSize: 15, fontWeight: 700 }}>Οδηγοί</div>
@@ -2644,6 +2726,7 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
   const [passengers, setPassengers] = useState(appointment?.passengers || 1);
   const [price, setPrice] = useState(appointment?.price != null ? String(appointment.price) : '');
   const [paymentMethod, setPaymentMethod] = useState(appointment?.paymentMethod || 'cash');
+  const [fareCalcStatus, setFareCalcStatus] = useState('');
   const [error, setError] = useState('');
 
   const conflict = useMemo(() => {
@@ -2743,6 +2826,37 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
 
         <div style={{ display: 'flex', gap: 10 }}>
           <div style={{ flex: 1 }}>
+            <label style={label}>Παραλαβή</label>
+            <input value={pickup} onChange={e => setPickup(e.target.value)} style={input} placeholder="π.χ. Αεροδρόμιο" />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={label}>Προορισμός</label>
+            <input value={dropoff} onChange={e => setDropoff(e.target.value)} style={input} placeholder="π.χ. Κέντρο" />
+          </div>
+        </div>
+
+        <button
+          onClick={async () => {
+            setFareCalcStatus('loading');
+            const result = await estimateFare(pickup, dropoff, state.fareSettings || { flagFall: 1.9, perKm: 1.65, minFare: 3.5 });
+            if (result.ok) {
+              setPrice(String(result.price));
+              setFareCalcStatus(`✓ ${result.km.toFixed(1)} χλμ · προτεινόμενη τιμή €${result.price.toFixed(2)} — μπορείς να την αλλάξεις`);
+            } else {
+              setFareCalcStatus(`✗ ${result.reason}`);
+            }
+          }}
+          disabled={!pickup || !dropoff || fareCalcStatus === 'loading'}
+          style={{ ...smallBtn(ACCENT), width: '100%', marginBottom: 8, opacity: (!pickup || !dropoff) ? 0.5 : 1, cursor: (!pickup || !dropoff) ? 'not-allowed' : 'pointer' }}
+        >
+          {fareCalcStatus === 'loading' ? 'Υπολογισμός...' : '🧮 Υπολογισμός τιμής από απόσταση'}
+        </button>
+        {fareCalcStatus && fareCalcStatus !== 'loading' && (
+          <div style={{ color: fareCalcStatus.startsWith('✓') ? GREEN : RED, fontSize: 12, marginBottom: 12 }}>{fareCalcStatus}</div>
+        )}
+
+        <div style={{ display: 'flex', gap: 10 }}>
+          <div style={{ flex: 1 }}>
             <label style={label}>Τιμή (€, προαιρετικό)</label>
             <input type="number" value={price} onChange={e => setPrice(e.target.value)} style={input} placeholder="π.χ. 35" />
           </div>
@@ -2753,17 +2867,6 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
               <option value="card">Κάρτα</option>
               <option value="prepaid">Πληρωμένο</option>
             </select>
-          </div>
-        </div>
-
-        <div style={{ display: 'flex', gap: 10 }}>
-          <div style={{ flex: 1 }}>
-            <label style={label}>Παραλαβή</label>
-            <input value={pickup} onChange={e => setPickup(e.target.value)} style={input} placeholder="π.χ. Αεροδρόμιο" />
-          </div>
-          <div style={{ flex: 1 }}>
-            <label style={label}>Προορισμός</label>
-            <input value={dropoff} onChange={e => setDropoff(e.target.value)} style={input} placeholder="π.χ. Κέντρο" />
           </div>
         </div>
 
