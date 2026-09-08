@@ -262,15 +262,45 @@ async function applyAppointmentPatch(state, persist, appointment, patch, actor) 
 // meant for heavy/commercial use. Silently returns null on any failure.
 async function geocodeAddress(address) {
   if (!address || !address.trim()) return null;
-  try {
-    const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(address + ', Θεσσαλονίκη')}`;
-    const res = await fetch(url);
-    const data = await res.json();
-    if (data && data[0]) return { lat: Number(data[0].lat), lng: Number(data[0].lon) };
-  } catch (e) {
-    console.error('geocodeAddress failed (non-fatal):', e);
+  const trimmed = address.trim();
+
+  const tryQuery = async (params) => {
+    try {
+      const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=gr&${params}`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (data && data[0]) return { lat: Number(data[0].lat), lng: Number(data[0].lon) };
+    } catch (e) {
+      console.error('geocodeAddress attempt failed (non-fatal):', e);
+    }
+    return null;
+  };
+
+  // A Greek postal code (5 digits, with or without the usual space, e.g. "546 55") mixed
+  // into the same free-text field as the street tends to confuse Nominatim's parser — it
+  // often matches the street name in the WRONG area and quietly ignores the postal code.
+  // Pulling it out and sending it as its own structured 'postalcode' parameter makes
+  // Nominatim actually enforce it, instead of just treating it as a hint.
+  const pcMatch = trimmed.match(/\b(\d{3}\s?\d{2})\b/);
+  if (pcMatch) {
+    const postalcode = pcMatch[1].replace(/\s/g, '');
+    const street = trimmed.replace(pcMatch[0], '').replace(/,\s*$/, '').replace(/,\s*,/, ',').trim();
+    if (street) {
+      const structured = await tryQuery(`street=${encodeURIComponent(street)}&postalcode=${encodeURIComponent(postalcode)}`);
+      if (structured) return structured;
+    }
   }
-  return null;
+
+  // Plain text, exactly as typed — this alone is what correctly finds landmarks/POIs like
+  // "Αεροδρόμιο Θεσσαλονίκης". Forcing ", Θεσσαλονίκη" onto every query (the old behaviour)
+  // actually broke this case, since the airport itself isn't administratively "in"
+  // Θεσσαλονίκη and the extra text just added confusing noise.
+  const plain = await tryQuery(`q=${encodeURIComponent(trimmed)}`);
+  if (plain) return plain;
+
+  // Last resort: retry with the city appended, in case the address alone was too vague
+  // (e.g. just "Τσιμισκή 20" with no other context).
+  return await tryQuery(`q=${encodeURIComponent(trimmed + ', Θεσσαλονίκη')}`);
 }
 
 // Estimates a fare: geocodes both addresses (free Nominatim), gets real driving distance
@@ -1164,6 +1194,7 @@ function BookingScreen({ state, driver, shift, onBack, onSubmit }) {
   const [arrivalTime, setArrivalTime] = useState('');
   const [customerName, setCustomerName] = useState('');
   const [passengers, setPassengers] = useState('1');
+  const [pickup, setPickup] = useState('');
   const [destination, setDestination] = useState('');
   const [price, setPrice] = useState('');
   const [paymentMethod, setPaymentMethod] = useState('cash'); // 'cash' | 'card' | 'app'
@@ -1179,12 +1210,25 @@ function BookingScreen({ state, driver, shift, onBack, onSubmit }) {
 
   const calcFare = async () => {
     setFareCalcStatus('loading');
+    const settings = state.fareSettings || { flagFall: 1.9, perKm: 1.65, minFare: 3.5 };
+    if (pickup.trim()) {
+      // A pickup address was typed — use it, don't assume "here".
+      const result = await estimateFare(pickup, destination, settings);
+      if (result.ok) {
+        setPrice(String(result.price));
+        setFareCalcStatus(`✓ ${result.km.toFixed(1)} χλμ · προτεινόμενη τιμή €${result.price.toFixed(2)}`);
+      } else {
+        setFareCalcStatus(`✗ ${result.reason}`);
+      }
+      return;
+    }
+    // No pickup typed — fall back to the driver's current GPS position.
     const here = await captureGPS();
-    if (!here) { setFareCalcStatus('✗ Δεν κατάφερα να πάρω τη θέση σου (GPS)'); return; }
-    const result = await estimateFare(null, destination, state.fareSettings || { flagFall: 1.9, perKm: 1.65, minFare: 3.5 }, here);
+    if (!here) { setFareCalcStatus('✗ Δεν κατάφερα να πάρω τη θέση σου (GPS) — ή γράψε σημείο παραλαβής παραπάνω'); return; }
+    const result = await estimateFare(null, destination, settings, here);
     if (result.ok) {
       setPrice(String(result.price));
-      setFareCalcStatus(`✓ ${result.km.toFixed(1)} χλμ από εδώ · προτεινόμενη τιμή €${result.price.toFixed(2)}`);
+      setFareCalcStatus(`✓ ${result.km.toFixed(1)} χλμ από τη θέση σου · προτεινόμενη τιμή €${result.price.toFixed(2)}`);
     } else {
       setFareCalcStatus(`✗ ${result.reason}`);
     }
@@ -1204,15 +1248,18 @@ function BookingScreen({ state, driver, shift, onBack, onSubmit }) {
       <label style={label}>Άτομα</label>
       <input type="number" min="1" value={passengers} onChange={e => setPassengers(e.target.value)} style={input} />
 
+      <label style={label}>Σημείο παραλαβής (προαιρετικό — αν το αφήσεις κενό, θα χρησιμοποιηθεί η τρέχουσα θέση σου)</label>
+      <input value={pickup} onChange={e => setPickup(e.target.value)} placeholder="π.χ. Αεροδρόμιο Μακεδονία" style={input} />
+
       <label style={label}>Προορισμός</label>
-      <input value={destination} onChange={e => setDestination(e.target.value)} placeholder="π.χ. Αεροδρόμιο" style={input} />
+      <input value={destination} onChange={e => setDestination(e.target.value)} placeholder="π.χ. Κέντρο" style={input} />
 
       <button
         onClick={calcFare}
         disabled={!destination || fareCalcStatus === 'loading'}
         style={{ ...smallBtn(ACCENT), width: '100%', marginBottom: 8, opacity: !destination ? 0.5 : 1, cursor: !destination ? 'not-allowed' : 'pointer' }}
       >
-        {fareCalcStatus === 'loading' ? 'Υπολογισμός...' : '🧮 Υπολογισμός τιμής από τη θέση μου'}
+        {fareCalcStatus === 'loading' ? 'Υπολογισμός...' : '🧮 Υπολογισμός τιμής'}
       </button>
       {fareCalcStatus && fareCalcStatus !== 'loading' && (
         <div style={{ color: fareCalcStatus.startsWith('✓') ? GREEN : RED, fontSize: 12, marginBottom: 12 }}>{fareCalcStatus}</div>
@@ -1245,7 +1292,7 @@ function BookingScreen({ state, driver, shift, onBack, onSubmit }) {
       <textarea value={notes} onChange={e => setNotes(e.target.value)} rows={2} style={{ ...input, resize: 'vertical' }} />
 
       <button
-        onClick={() => canSubmit && onSubmit({ flightNumber, arrivalTime, customerName, passengers: Number(passengers), destination, price: Number(price), paymentMethod, notes, createdAt: new Date().toISOString() })}
+        onClick={() => canSubmit && onSubmit({ flightNumber, arrivalTime, customerName, passengers: Number(passengers), pickup, destination, price: Number(price), paymentMethod, notes, createdAt: new Date().toISOString() })}
         disabled={!canSubmit}
         style={{ ...btnPrimary, justifyContent: 'center', marginTop: 4, opacity: canSubmit ? 1 : 0.5, cursor: canSubmit ? 'pointer' : 'not-allowed' }}
       >
