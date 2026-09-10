@@ -126,6 +126,8 @@ const MUTE = '#8B92A0';
 const GREEN = '#4A9B6E';
 const RED = '#C1543C';
 
+const PAY_LABELS = { cash: 'Μετρητά', card: 'Κάρτα', app: 'App', prepaid: 'Πληρωμένο' };
+
 function fmtEUR(n) { return `€${(Number(n) || 0).toFixed(2)}`; }
 function todayStr() {
   const d = new Date();
@@ -242,6 +244,7 @@ async function applyAppointmentPatch(state, persist, appointment, patch, actor) 
           driverId: appointment.driverId,
           appointmentId: appointment.id,
           customerName: appointment.customerName,
+          pickup: appointment.pickup,
           destination: appointment.dropoff,
           passengers: appointment.passengers || 1,
           price: Number(appointment.price) || 0,
@@ -260,58 +263,59 @@ async function applyAppointmentPatch(state, persist, appointment, patch, actor) 
 // Free geocoding via OpenStreetMap's Nominatim (same source as the map tiles we already
 // use). Fine for our low volume (a handful of new appointment addresses per day) — not
 // meant for heavy/commercial use. Silently returns null on any failure.
-async function geocodeAddress(address) {
-  if (!address || !address.trim()) return null;
+// Returns up to 5 candidate matches for an address, each with a human-readable label so
+// the UI can show WHAT it matched instead of silently trusting the first hit (which was
+// the main cause of wrong fares — a bad match looked identical to a good one).
+// Results are biased toward the wider Thessaloniki area but not restricted to it.
+const THESS_VIEWBOX = '22.60,40.80,23.30,40.35'; // left,top,right,bottom
+async function searchAddresses(address) {
+  if (!address || !address.trim()) return [];
   const trimmed = address.trim();
 
-  const tryQuery = async (params) => {
+  const run = async (params) => {
     try {
-      const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=gr&${params}`;
+      const url = `https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&limit=5&countrycodes=gr&viewbox=${THESS_VIEWBOX}&${params}`;
       const res = await fetch(url);
       const data = await res.json();
-      if (data && data[0]) return { lat: Number(data[0].lat), lng: Number(data[0].lon) };
+      if (!Array.isArray(data)) return [];
+      return data.map(d => ({ lat: Number(d.lat), lng: Number(d.lon), label: d.display_name }));
     } catch (e) {
-      console.error('geocodeAddress attempt failed (non-fatal):', e);
+      console.error('searchAddresses attempt failed (non-fatal):', e);
+      return [];
     }
-    return null;
   };
 
-  // A Greek postal code (5 digits, with or without the usual space, e.g. "546 55") mixed
-  // into the same free-text field as the street tends to confuse Nominatim's parser — it
-  // often matches the street name in the WRONG area and quietly ignores the postal code.
-  // Pulling it out and sending it as its own structured 'postalcode' parameter makes
-  // Nominatim actually enforce it, instead of just treating it as a hint.
+  // A Greek postal code mixed into free text confuses the parser — it often matches the
+  // street in the wrong area and quietly ignores the code. Sending it as its own
+  // structured parameter makes it actually count.
   const pcMatch = trimmed.match(/\b(\d{3}\s?\d{2})\b/);
   if (pcMatch) {
     const postalcode = pcMatch[1].replace(/\s/g, '');
     const street = trimmed.replace(pcMatch[0], '').replace(/,\s*$/, '').replace(/,\s*,/, ',').trim();
     if (street) {
-      const structured = await tryQuery(`street=${encodeURIComponent(street)}&postalcode=${encodeURIComponent(postalcode)}`);
-      if (structured) return structured;
+      const structured = await run(`street=${encodeURIComponent(street)}&postalcode=${encodeURIComponent(postalcode)}`);
+      if (structured.length) return structured;
     }
   }
 
-  // Plain text, exactly as typed — this alone is what correctly finds landmarks/POIs like
-  // "Αεροδρόμιο Θεσσαλονίκης". Forcing ", Θεσσαλονίκη" onto every query (the old behaviour)
-  // actually broke this case, since the airport itself isn't administratively "in"
-  // Θεσσαλονίκη and the extra text just added confusing noise.
-  const plain = await tryQuery(`q=${encodeURIComponent(trimmed)}`);
-  if (plain) return plain;
+  // Exactly as typed — this is what correctly finds landmarks like "Αεροδρόμιο Θεσσαλονίκης".
+  const plain = await run(`q=${encodeURIComponent(trimmed)}`);
+  if (plain.length) return plain;
 
-  // Last resort: retry with the city appended, in case the address alone was too vague
-  // (e.g. just "Τσιμισκή 20" with no other context).
-  return await tryQuery(`q=${encodeURIComponent(trimmed + ', Θεσσαλονίκη')}`);
+  // Last resort for vague input like a bare street name with no other context.
+  return await run(`q=${encodeURIComponent(trimmed + ', Θεσσαλονίκη')}`);
 }
 
-// Estimates a fare: geocodes both addresses (free Nominatim), gets real driving distance
-// (free OSRM demo server — fine for our low volume, not for heavy commercial use), then
-// applies the admin's configured tariff. Returns {ok:false, reason} if anything fails —
-// never blocks the form, this is always just a starting suggestion.
-async function estimateFare(pickup, dropoff, fareSettings, knownFrom) {
-  const from = knownFrom || await geocodeAddress(pickup);
-  if (!from) return { ok: false, reason: 'Δεν βρέθηκε η διεύθυνση παραλαβής' };
-  const to = await geocodeAddress(dropoff);
-  if (!to) return { ok: false, reason: 'Δεν βρέθηκε ο προορισμός' };
+// Convenience wrapper for background use (map pins) where there's no UI to choose from.
+async function geocodeAddress(address) {
+  const results = await searchAddresses(address);
+  return results[0] || null;
+}
+
+// Computes driving distance and fare between two ALREADY-RESOLVED points. Address
+// resolution now happens in the UI (so the user can see and correct what was matched)
+// rather than silently in here.
+async function computeFareBetween(from, to, fareSettings) {
   try {
     const url = `https://router.project-osrm.org/route/v1/driving/${from.lng},${from.lat};${to.lng},${to.lat}?overview=false`;
     const res = await fetch(url);
@@ -321,9 +325,9 @@ async function estimateFare(pickup, dropoff, fareSettings, knownFrom) {
     const km = meters / 1000;
     const raw = (fareSettings.flagFall || 0) + km * (fareSettings.perKm || 0);
     const price = Math.max(raw, fareSettings.minFare || 0);
-    return { ok: true, km, price: Math.round(price * 100) / 100, from, to };
+    return { ok: true, km, price: Math.round(price * 100) / 100 };
   } catch (e) {
-    console.error('estimateFare routing failed:', e);
+    console.error('computeFareBetween routing failed:', e);
     return { ok: false, reason: 'Η υπηρεσία διαδρομών δεν αποκρίθηκε' };
   }
 }
@@ -1151,6 +1155,105 @@ function StartShiftScreen({ state, driver, cars, activeShifts, onBack, onSubmit 
 // guarantee a 24-hour display everywhere, on every phone.
 const HOURS_24 = Array.from({ length: 24 }, (_, i) => String(i).padStart(2, '0'));
 const MINUTES_5 = ['00', '05', '10', '15', '20', '25', '30', '35', '40', '45', '50', '55'];
+// Shared fare calculator. Resolves both addresses, SHOWS what it actually matched, and
+// lets the user swap in a different candidate — the previous silent "first result wins"
+// behaviour is what produced wrong prices without any visible warning.
+function FareCalculator({ fareSettings, pickupText, dropoffText, useCurrentPositionAsPickup, onPriceComputed }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [fromOpts, setFromOpts] = useState([]);
+  const [toOpts, setToOpts] = useState([]);
+  const [fromIdx, setFromIdx] = useState(0);
+  const [toIdx, setToIdx] = useState(0);
+  const [result, setResult] = useState(null); // {km, price}
+  const [usedGps, setUsedGps] = useState(false);
+
+  const priceFor = async (from, to) => {
+    const res = await computeFareBetween(from, to, fareSettings);
+    if (!res.ok) { setError(res.reason); setResult(null); return; }
+    setError('');
+    setResult({ km: res.km, price: res.price });
+    onPriceComputed(res.price);
+  };
+
+  const run = async () => {
+    setBusy(true); setError(''); setResult(null); setUsedGps(false);
+    let fromList = [];
+    if (pickupText && pickupText.trim()) {
+      fromList = await searchAddresses(pickupText);
+      if (fromList.length === 0) { setError('Δεν βρέθηκε η διεύθυνση παραλαβής — δοκίμασε πιο συγκεκριμένα (οδό + αριθμό + περιοχή)'); setBusy(false); setFromOpts([]); setToOpts([]); return; }
+    } else if (useCurrentPositionAsPickup) {
+      const here = await captureGPS();
+      if (!here) { setError('Δεν πήρα τη θέση σου (GPS) — γράψε σημείο παραλαβής'); setBusy(false); return; }
+      fromList = [{ ...here, label: 'Η τρέχουσα θέση σου' }];
+      setUsedGps(true);
+    } else {
+      setError('Συμπλήρωσε σημείο παραλαβής'); setBusy(false); return;
+    }
+
+    const toList = await searchAddresses(dropoffText);
+    if (toList.length === 0) { setError('Δεν βρέθηκε ο προορισμός — δοκίμασε πιο συγκεκριμένα (οδό + αριθμό + περιοχή)'); setBusy(false); setFromOpts(fromList); setToOpts([]); return; }
+
+    setFromOpts(fromList); setToOpts(toList); setFromIdx(0); setToIdx(0);
+    await priceFor(fromList[0], toList[0]);
+    setBusy(false);
+  };
+
+  const reprice = async (fi, ti) => {
+    setFromIdx(fi); setToIdx(ti);
+    setBusy(true);
+    await priceFor(fromOpts[fi], toOpts[ti]);
+    setBusy(false);
+  };
+
+  const canRun = !!dropoffText && (!!pickupText || useCurrentPositionAsPickup);
+
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <button
+        onClick={run}
+        disabled={!canRun || busy}
+        style={{ ...smallBtn(ACCENT), width: '100%', marginBottom: 8, opacity: canRun ? 1 : 0.5, cursor: canRun ? 'pointer' : 'not-allowed' }}
+      >
+        {busy ? 'Υπολογισμός...' : '🧮 Υπολογισμός τιμής'}
+      </button>
+
+      {error && <div style={{ color: RED, fontSize: 12, marginBottom: 8 }}>✗ {error}</div>}
+
+      {result && (
+        <div style={{ background: 'rgba(74,155,110,0.10)', border: `1px solid ${GREEN}`, borderRadius: 10, padding: 12, fontSize: 12 }}>
+          <div style={{ color: GREEN, fontWeight: 700, marginBottom: 8 }}>
+            {result.km.toFixed(1)} χλμ · προτεινόμενη τιμή {fmtEUR(result.price)}
+          </div>
+          <div style={{ color: MUTE, marginBottom: 6 }}>Έλεγξε ότι βρήκε τα σωστά σημεία:</div>
+
+          <div style={{ marginBottom: 6 }}>
+            <div style={{ color: MUTE, fontSize: 11 }}>Από</div>
+            {usedGps ? (
+              <div style={{ color: TEXT }}>Η τρέχουσα θέση σου</div>
+            ) : (
+              <select value={fromIdx} onChange={e => reprice(Number(e.target.value), toIdx)} style={{ ...input, marginBottom: 0, fontSize: 12, padding: '6px 8px' }}>
+                {fromOpts.map((o, i) => <option key={i} value={i}>{o.label}</option>)}
+              </select>
+            )}
+          </div>
+
+          <div>
+            <div style={{ color: MUTE, fontSize: 11 }}>Προς</div>
+            <select value={toIdx} onChange={e => reprice(fromIdx, Number(e.target.value))} style={{ ...input, marginBottom: 0, fontSize: 12, padding: '6px 8px' }}>
+              {toOpts.map((o, i) => <option key={i} value={i}>{o.label}</option>)}
+            </select>
+          </div>
+
+          <div style={{ color: MUTE, fontSize: 11, marginTop: 8 }}>
+            Αν κάποιο σημείο είναι λάθος, διάλεξε άλλο από τη λίστα — η τιμή ξαναϋπολογίζεται αυτόματα. Μπορείς πάντα να γράψεις τιμή με το χέρι.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Time24Input({ value, onChange }) {
   const [h, m] = (value || '00:00').split(':');
   return (
@@ -1199,7 +1302,6 @@ function BookingScreen({ state, driver, shift, onBack, onSubmit }) {
   const [price, setPrice] = useState('');
   const [paymentMethod, setPaymentMethod] = useState('cash'); // 'cash' | 'card' | 'app'
   const [notes, setNotes] = useState('');
-  const [fareCalcStatus, setFareCalcStatus] = useState('');
 
   const canSubmit = customerName && destination && price;
   const PAY_OPTIONS = [
@@ -1207,32 +1309,6 @@ function BookingScreen({ state, driver, shift, onBack, onSubmit }) {
     { id: 'card', label: 'Κάρτα', icon: CreditCard },
     { id: 'app', label: 'App', icon: Smartphone },
   ];
-
-  const calcFare = async () => {
-    setFareCalcStatus('loading');
-    const settings = state.fareSettings || { flagFall: 1.9, perKm: 1.65, minFare: 3.5 };
-    if (pickup.trim()) {
-      // A pickup address was typed — use it, don't assume "here".
-      const result = await estimateFare(pickup, destination, settings);
-      if (result.ok) {
-        setPrice(String(result.price));
-        setFareCalcStatus(`✓ ${result.km.toFixed(1)} χλμ · προτεινόμενη τιμή €${result.price.toFixed(2)}`);
-      } else {
-        setFareCalcStatus(`✗ ${result.reason}`);
-      }
-      return;
-    }
-    // No pickup typed — fall back to the driver's current GPS position.
-    const here = await captureGPS();
-    if (!here) { setFareCalcStatus('✗ Δεν κατάφερα να πάρω τη θέση σου (GPS) — ή γράψε σημείο παραλαβής παραπάνω'); return; }
-    const result = await estimateFare(null, destination, settings, here);
-    if (result.ok) {
-      setPrice(String(result.price));
-      setFareCalcStatus(`✓ ${result.km.toFixed(1)} χλμ από τη θέση σου · προτεινόμενη τιμή €${result.price.toFixed(2)}`);
-    } else {
-      setFareCalcStatus(`✗ ${result.reason}`);
-    }
-  };
 
   return (
     <Screen title="Νέα Προμίσθωση" subtitle={carLabelById(state, shift?.car || driver.car)} onBack={onBack}>
@@ -1254,16 +1330,13 @@ function BookingScreen({ state, driver, shift, onBack, onSubmit }) {
       <label style={label}>Προορισμός</label>
       <input value={destination} onChange={e => setDestination(e.target.value)} placeholder="π.χ. Κέντρο" style={input} />
 
-      <button
-        onClick={calcFare}
-        disabled={!destination || fareCalcStatus === 'loading'}
-        style={{ ...smallBtn(ACCENT), width: '100%', marginBottom: 8, opacity: !destination ? 0.5 : 1, cursor: !destination ? 'not-allowed' : 'pointer' }}
-      >
-        {fareCalcStatus === 'loading' ? 'Υπολογισμός...' : '🧮 Υπολογισμός τιμής'}
-      </button>
-      {fareCalcStatus && fareCalcStatus !== 'loading' && (
-        <div style={{ color: fareCalcStatus.startsWith('✓') ? GREEN : RED, fontSize: 12, marginBottom: 12 }}>{fareCalcStatus}</div>
-      )}
+      <FareCalculator
+        fareSettings={state.fareSettings || { flagFall: 1.9, perKm: 1.65, minFare: 3.5 }}
+        pickupText={pickup}
+        dropoffText={destination}
+        useCurrentPositionAsPickup
+        onPriceComputed={p => setPrice(String(p))}
+      />
 
       <label style={label}>Τιμή (€)</label>
       <input type="number" value={price} onChange={e => setPrice(e.target.value)} placeholder="π.χ. 35" style={input} />
@@ -1608,8 +1681,8 @@ function ShiftStatsModal({ state, shift: s, onClose }) {
               {bookings.map(b => (
                 <div key={b.id} style={{ display: 'flex', justifyContent: 'space-between', background: CARD, borderRadius: 8, padding: 10, border: `1px solid ${BORDER}` }}>
                   <div>
-                    <div style={{ color: TEXT, fontSize: 13 }}>{b.customerName} → {b.destination}</div>
-                    <div style={{ color: MUTE, fontSize: 11 }}>{{ cash: 'Μετρητά', card: 'Κάρτα', app: 'App' }[b.paymentMethod || 'cash']}</div>
+                    <div style={{ color: TEXT, fontSize: 13 }}>{b.customerName} · {b.pickup ? `${b.pickup} → ` : ''}{b.destination}</div>
+                    <div style={{ color: MUTE, fontSize: 11 }}>{PAY_LABELS[b.paymentMethod] || PAY_LABELS.cash}</div>
                   </div>
                   <div style={{ color: GREEN, fontSize: 13, fontWeight: 700 }}>{fmtEUR(b.price)}</div>
                 </div>
@@ -2773,7 +2846,6 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
   const [passengers, setPassengers] = useState(appointment?.passengers || 1);
   const [price, setPrice] = useState(appointment?.price != null ? String(appointment.price) : '');
   const [paymentMethod, setPaymentMethod] = useState(appointment?.paymentMethod || 'cash');
-  const [fareCalcStatus, setFareCalcStatus] = useState('');
   const [error, setError] = useState('');
 
   const conflict = useMemo(() => {
@@ -2882,25 +2954,12 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
           </div>
         </div>
 
-        <button
-          onClick={async () => {
-            setFareCalcStatus('loading');
-            const result = await estimateFare(pickup, dropoff, state.fareSettings || { flagFall: 1.9, perKm: 1.65, minFare: 3.5 });
-            if (result.ok) {
-              setPrice(String(result.price));
-              setFareCalcStatus(`✓ ${result.km.toFixed(1)} χλμ · προτεινόμενη τιμή €${result.price.toFixed(2)} — μπορείς να την αλλάξεις`);
-            } else {
-              setFareCalcStatus(`✗ ${result.reason}`);
-            }
-          }}
-          disabled={!pickup || !dropoff || fareCalcStatus === 'loading'}
-          style={{ ...smallBtn(ACCENT), width: '100%', marginBottom: 8, opacity: (!pickup || !dropoff) ? 0.5 : 1, cursor: (!pickup || !dropoff) ? 'not-allowed' : 'pointer' }}
-        >
-          {fareCalcStatus === 'loading' ? 'Υπολογισμός...' : '🧮 Υπολογισμός τιμής από απόσταση'}
-        </button>
-        {fareCalcStatus && fareCalcStatus !== 'loading' && (
-          <div style={{ color: fareCalcStatus.startsWith('✓') ? GREEN : RED, fontSize: 12, marginBottom: 12 }}>{fareCalcStatus}</div>
-        )}
+        <FareCalculator
+          fareSettings={state.fareSettings || { flagFall: 1.9, perKm: 1.65, minFare: 3.5 }}
+          pickupText={pickup}
+          dropoffText={dropoff}
+          onPriceComputed={p => setPrice(String(p))}
+        />
 
         <div style={{ display: 'flex', gap: 10 }}>
           <div style={{ flex: 1 }}>
@@ -3480,7 +3539,7 @@ function BookingsTab({ state, persist }) {
             <div key={b.id} style={{ background: CARD, borderRadius: 12, padding: 14, border: `1px solid ${BORDER}` }}>
               <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                 <div>
-                  <div style={{ color: TEXT, fontSize: 14, fontWeight: 700 }}>{b.customerName} → {b.destination}</div>
+                  <div style={{ color: TEXT, fontSize: 14, fontWeight: 700 }}>{b.customerName} · {b.pickup ? `${b.pickup} → ` : ''}{b.destination}</div>
                   <div style={{ color: MUTE, fontSize: 12, display: 'flex', gap: 10, marginTop: 4, flexWrap: 'wrap' }}>
                     {b.flightNumber && <span><Plane size={11} style={{ verticalAlign: 'middle' }} /> {b.flightNumber} {b.arrivalTime}</span>}
                     <span><Users size={11} style={{ verticalAlign: 'middle' }} /> {b.passengers}</span>
@@ -3489,7 +3548,7 @@ function BookingsTab({ state, persist }) {
                 </div>
                 <div style={{ textAlign: 'right' }}>
                   <div style={{ color: GREEN, fontSize: 15, fontWeight: 700 }}>{fmtEUR(b.price)}</div>
-                  <div style={{ color: MUTE, fontSize: 11 }}>{{ cash: 'Μετρητά', card: 'Κάρτα', app: 'App' }[b.paymentMethod || 'cash']}</div>
+                  <div style={{ color: MUTE, fontSize: 11 }}>{PAY_LABELS[b.paymentMethod] || PAY_LABELS.cash}</div>
                 </div>
               </div>
               {b.notes && <div style={{ color: MUTE, fontSize: 12, marginTop: 8, borderTop: `1px solid ${BORDER}`, paddingTop: 8 }}>{b.notes}</div>}
@@ -3511,6 +3570,7 @@ function EditBookingModal({ state, persist, booking, onClose }) {
   const [arrivalTime, setArrivalTime] = useState(booking.arrivalTime || '');
   const [customerName, setCustomerName] = useState(booking.customerName || '');
   const [passengers, setPassengers] = useState(String(booking.passengers ?? ''));
+  const [pickup, setPickup] = useState(booking.pickup || '');
   const [destination, setDestination] = useState(booking.destination || '');
   const [price, setPrice] = useState(String(booking.price ?? ''));
   const [paymentMethod, setPaymentMethod] = useState(booking.paymentMethod || 'cash');
@@ -3523,6 +3583,7 @@ function EditBookingModal({ state, persist, booking, onClose }) {
         ...b,
         flightNumber, arrivalTime, customerName,
         passengers: passengers === '' ? b.passengers : Number(passengers),
+        pickup,
         destination,
         price: price === '' ? b.price : Number(price),
         paymentMethod,
@@ -3542,6 +3603,9 @@ function EditBookingModal({ state, persist, booking, onClose }) {
 
         <label style={label}>Όνομα πελάτη</label>
         <input value={customerName} onChange={e => setCustomerName(e.target.value)} style={input} />
+
+        <label style={label}>Σημείο παραλαβής</label>
+        <input value={pickup} onChange={e => setPickup(e.target.value)} style={input} />
 
         <label style={label}>Προορισμός</label>
         <input value={destination} onChange={e => setDestination(e.target.value)} style={input} />
