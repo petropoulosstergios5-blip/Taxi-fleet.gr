@@ -260,77 +260,73 @@ async function applyAppointmentPatch(state, persist, appointment, patch, actor) 
   await persist(nextState);
 }
 
-// Free geocoding via OpenStreetMap's Nominatim (same source as the map tiles we already
-// use). Fine for our low volume (a handful of new appointment addresses per day) — not
-// meant for heavy/commercial use. Silently returns null on any failure.
-// Returns up to 5 candidate matches for an address, each with a human-readable label so
-// the UI can show WHAT it matched instead of silently trusting the first hit (which was
-// the main cause of wrong fares — a bad match looked identical to a good one).
-// Results are biased toward the wider Thessaloniki area but not restricted to it.
-const THESS_VIEWBOX = '22.60,40.80,23.30,40.35'; // left,top,right,bottom
-async function searchAddresses(address) {
-  if (!address || !address.trim()) return [];
-  const trimmed = address.trim();
+// Address lookup + routing via Google Maps Platform, proxied through our own Edge
+// Function. The API key deliberately lives server-side: embedding it in the app bundle
+// would let anyone read it from the page source and spend against the billing account.
+const MAPS_PROXY_URL = `${SUPABASE_URL}/functions/v1/maps-proxy`;
+const placeCache = new Map();
 
-  const run = async (params) => {
-    try {
-      const url = `https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&limit=5&countrycodes=gr&viewbox=${THESS_VIEWBOX}&${params}`;
-      const res = await fetch(url);
-      const data = await res.json();
-      if (!Array.isArray(data)) return [];
-      return data.map(d => ({ lat: Number(d.lat), lng: Number(d.lon), label: d.display_name }));
-    } catch (e) {
-      console.error('searchAddresses attempt failed (non-fatal):', e);
-      return [];
-    }
-  };
-
-  // A Greek postal code mixed into free text confuses the parser — it often matches the
-  // street in the wrong area and quietly ignores the code. Sending it as its own
-  // structured parameter makes it actually count.
-  const pcMatch = trimmed.match(/\b(\d{3}\s?\d{2})\b/);
-  if (pcMatch) {
-    const postalcode = pcMatch[1].replace(/\s/g, '');
-    const street = trimmed.replace(pcMatch[0], '').replace(/,\s*$/, '').replace(/,\s*,/, ',').trim();
-    if (street) {
-      const structured = await run(`street=${encodeURIComponent(street)}&postalcode=${encodeURIComponent(postalcode)}`);
-      if (structured.length) return structured;
-    }
+async function mapsProxy(payload) {
+  const res = await fetch(MAPS_PROXY_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (data.error) {
+    const err = new Error(data.error);
+    err.fromMaps = true;
+    throw err;
   }
-
-  // Exactly as typed — this is what correctly finds landmarks like "Αεροδρόμιο Θεσσαλονίκης".
-  const plain = await run(`q=${encodeURIComponent(trimmed)}`);
-  if (plain.length) return plain;
-
-  // Last resort for vague input like a bare street name with no other context.
-  return await run(`q=${encodeURIComponent(trimmed + ', Θεσσαλονίκη')}`);
+  return data;
 }
 
-// Convenience wrapper for background use (map pins) where there's no UI to choose from.
+// Type-ahead suggestions. Returns [{placeId, label}] — coordinates are fetched later,
+// only for the one the user actually picks, which keeps API usage (and cost) minimal.
+async function suggestAddresses(text) {
+  if (!text || text.trim().length < 3) return [];
+  const { suggestions } = await mapsProxy({ action: 'autocomplete', text: text.trim() });
+  return suggestions || [];
+}
+
+// Resolves a suggestion the user picked into real coordinates.
+async function resolvePlace(placeId) {
+  if (placeCache.has(placeId)) return placeCache.get(placeId);
+  const place = await mapsProxy({ action: 'details', placeId });
+  placeCache.set(placeId, place);
+  return place;
+}
+
+// Fallback for free-typed text that was never picked from the suggestion list.
 async function geocodeAddress(address) {
-  const results = await searchAddresses(address);
-  return results[0] || null;
+  if (!address || !address.trim()) return null;
+  const key = 'q:' + address.trim().toLowerCase();
+  if (placeCache.has(key)) return placeCache.get(key);
+  try {
+    const place = await mapsProxy({ action: 'geocode', text: address.trim() });
+    placeCache.set(key, place);
+    return place;
+  } catch (e) {
+    console.error('geocodeAddress failed (non-fatal):', e);
+    return null;
+  }
 }
 
-// Computes driving distance and fare between two ALREADY-RESOLVED points. Address
-// resolution now happens in the UI (so the user can see and correct what was matched)
-// rather than silently in here.
+// Driving distance between two resolved points, then the admin's tariff applied on top.
 async function computeFareBetween(from, to, fareSettings) {
   try {
-    const url = `https://router.project-osrm.org/route/v1/driving/${from.lng},${from.lat};${to.lng},${to.lat}?overview=false`;
-    const res = await fetch(url);
-    const data = await res.json();
-    const meters = data?.routes?.[0]?.distance;
+    const { meters } = await mapsProxy({ action: 'route', from, to });
     if (meters == null) return { ok: false, reason: 'Δεν βρέθηκε διαδρομή ανάμεσα στα δύο σημεία' };
     const km = meters / 1000;
     const raw = (fareSettings.flagFall || 0) + km * (fareSettings.perKm || 0);
     const price = Math.max(raw, fareSettings.minFare || 0);
     return { ok: true, km, price: Math.round(price * 100) / 100 };
   } catch (e) {
-    console.error('computeFareBetween routing failed:', e);
-    return { ok: false, reason: 'Η υπηρεσία διαδρομών δεν αποκρίθηκε' };
+    console.error('computeFareBetween failed:', e);
+    return { ok: false, reason: e.fromMaps ? e.message : 'Η υπηρεσία διαδρομών δεν αποκρίθηκε' };
   }
 }
+
 
 function checkAppointmentConflict({ appointments, shifts, cars }, { date, time, durationMin, driverId, car, excludeId }) {
   const newRange = apptRange({ time, durationMin });
@@ -1155,54 +1151,99 @@ function StartShiftScreen({ state, driver, cars, activeShifts, onBack, onSubmit 
 // guarantee a 24-hour display everywhere, on every phone.
 const HOURS_24 = Array.from({ length: 24 }, (_, i) => String(i).padStart(2, '0'));
 const MINUTES_5 = ['00', '05', '10', '15', '20', '25', '30', '35', '40', '45', '50', '55'];
-// Shared fare calculator. Resolves both addresses, SHOWS what it actually matched, and
-// lets the user swap in a different candidate — the previous silent "first result wins"
-// behaviour is what produced wrong prices without any visible warning.
-function FareCalculator({ fareSettings, pickupText, dropoffText, useCurrentPositionAsPickup, onPriceComputed }) {
+// An address field with Google-powered type-ahead. Picking a suggestion locks in an exact
+// place (no guessing), which is what makes the fare reliable. Free-typed text still works
+// as a fallback — it just gets geocoded on a best-effort basis.
+function AddressAutocomplete({ label: fieldLabel, value, onChange, onPick, placeholder }) {
+  const [suggestions, setSuggestions] = useState([]);
+  const [open, setOpen] = useState(false);
+  const debounceRef = useRef(null);
+
+  const handleChange = (text) => {
+    onChange(text);
+    onPick(null); // typing invalidates any previously picked place
+    clearTimeout(debounceRef.current);
+    if (!text || text.trim().length < 3) { setSuggestions([]); setOpen(false); return; }
+    // Wait for a pause in typing — one lookup per pause instead of one per keystroke.
+    debounceRef.current = setTimeout(async () => {
+      try {
+        const list = await suggestAddresses(text);
+        setSuggestions(list);
+        setOpen(list.length > 0);
+      } catch (e) {
+        setSuggestions([]); setOpen(false);
+      }
+    }, 400);
+  };
+
+  return (
+    <div style={{ position: 'relative' }}>
+      <label style={label}>{fieldLabel}</label>
+      <input
+        value={value}
+        onChange={e => handleChange(e.target.value)}
+        onFocus={() => suggestions.length > 0 && setOpen(true)}
+        placeholder={placeholder}
+        style={input}
+      />
+      {open && (
+        <>
+          <div onClick={() => setOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 39 }} />
+          <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, marginTop: -10, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, zIndex: 40, overflow: 'hidden', boxShadow: '0 8px 24px rgba(0,0,0,0.4)' }}>
+            {suggestions.map(s => (
+              <button
+                key={s.placeId}
+                onClick={() => { onChange(s.label); onPick(s.placeId); setOpen(false); setSuggestions([]); }}
+                style={{ display: 'block', width: '100%', textAlign: 'left', background: 'none', border: 'none', borderBottom: `1px solid ${BORDER}`, color: TEXT, padding: '10px 12px', fontSize: 13, cursor: 'pointer' }}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// Shared fare calculator. Works off exact places when the user picked from the
+// suggestions, and falls back to geocoding free text otherwise.
+function FareCalculator({ fareSettings, pickupText, pickupPlaceId, dropoffText, dropoffPlaceId, useCurrentPositionAsPickup, onPriceComputed }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const [fromOpts, setFromOpts] = useState([]);
-  const [toOpts, setToOpts] = useState([]);
-  const [fromIdx, setFromIdx] = useState(0);
-  const [toIdx, setToIdx] = useState(0);
-  const [result, setResult] = useState(null); // {km, price}
-  const [usedGps, setUsedGps] = useState(false);
+  const [result, setResult] = useState(null); // {km, price, fromLabel, toLabel}
 
-  const priceFor = async (from, to) => {
-    const res = await computeFareBetween(from, to, fareSettings);
-    if (!res.ok) { setError(res.reason); setResult(null); return; }
-    setError('');
-    setResult({ km: res.km, price: res.price });
-    onPriceComputed(res.price);
+  const resolveEnd = async (text, placeId) => {
+    if (placeId) return await resolvePlace(placeId);
+    return await geocodeAddress(text);
   };
 
   const run = async () => {
-    setBusy(true); setError(''); setResult(null); setUsedGps(false);
-    let fromList = [];
-    if (pickupText && pickupText.trim()) {
-      fromList = await searchAddresses(pickupText);
-      if (fromList.length === 0) { setError('Δεν βρέθηκε η διεύθυνση παραλαβής — δοκίμασε πιο συγκεκριμένα (οδό + αριθμό + περιοχή)'); setBusy(false); setFromOpts([]); setToOpts([]); return; }
-    } else if (useCurrentPositionAsPickup) {
-      const here = await captureGPS();
-      if (!here) { setError('Δεν πήρα τη θέση σου (GPS) — γράψε σημείο παραλαβής'); setBusy(false); return; }
-      fromList = [{ ...here, label: 'Η τρέχουσα θέση σου' }];
-      setUsedGps(true);
-    } else {
-      setError('Συμπλήρωσε σημείο παραλαβής'); setBusy(false); return;
+    setBusy(true); setError(''); setResult(null);
+    try {
+      let from, fromLabel;
+      if (pickupText && pickupText.trim()) {
+        from = await resolveEnd(pickupText, pickupPlaceId);
+        if (!from) { setError('Δεν βρέθηκε η διεύθυνση παραλαβής — διάλεξε μία από τις προτάσεις καθώς πληκτρολογείς'); setBusy(false); return; }
+        fromLabel = from.label;
+      } else if (useCurrentPositionAsPickup) {
+        const here = await captureGPS();
+        if (!here) { setError('Δεν πήρα τη θέση σου (GPS) — γράψε σημείο παραλαβής'); setBusy(false); return; }
+        from = here; fromLabel = 'Η τρέχουσα θέση σου';
+      } else {
+        setError('Συμπλήρωσε σημείο παραλαβής'); setBusy(false); return;
+      }
+
+      const to = await resolveEnd(dropoffText, dropoffPlaceId);
+      if (!to) { setError('Δεν βρέθηκε ο προορισμός — διάλεξε μία από τις προτάσεις καθώς πληκτρολογείς'); setBusy(false); return; }
+
+      const res = await computeFareBetween(from, to, fareSettings);
+      if (!res.ok) { setError(res.reason); setBusy(false); return; }
+      setResult({ km: res.km, price: res.price, fromLabel, toLabel: to.label });
+      onPriceComputed(res.price);
+    } catch (e) {
+      setError(e.fromMaps ? e.message : 'Η υπηρεσία χαρτών δεν αποκρίθηκε — ξαναδοκίμασε σε λίγο.');
     }
-
-    const toList = await searchAddresses(dropoffText);
-    if (toList.length === 0) { setError('Δεν βρέθηκε ο προορισμός — δοκίμασε πιο συγκεκριμένα (οδό + αριθμό + περιοχή)'); setBusy(false); setFromOpts(fromList); setToOpts([]); return; }
-
-    setFromOpts(fromList); setToOpts(toList); setFromIdx(0); setToIdx(0);
-    await priceFor(fromList[0], toList[0]);
-    setBusy(false);
-  };
-
-  const reprice = async (fi, ti) => {
-    setFromIdx(fi); setToIdx(ti);
-    setBusy(true);
-    await priceFor(fromOpts[fi], toOpts[ti]);
     setBusy(false);
   };
 
@@ -1222,32 +1263,12 @@ function FareCalculator({ fareSettings, pickupText, dropoffText, useCurrentPosit
 
       {result && (
         <div style={{ background: 'rgba(74,155,110,0.10)', border: `1px solid ${GREEN}`, borderRadius: 10, padding: 12, fontSize: 12 }}>
-          <div style={{ color: GREEN, fontWeight: 700, marginBottom: 8 }}>
+          <div style={{ color: GREEN, fontWeight: 700, marginBottom: 6 }}>
             {result.km.toFixed(1)} χλμ · προτεινόμενη τιμή {fmtEUR(result.price)}
           </div>
-          <div style={{ color: MUTE, marginBottom: 6 }}>Έλεγξε ότι βρήκε τα σωστά σημεία:</div>
-
-          <div style={{ marginBottom: 6 }}>
-            <div style={{ color: MUTE, fontSize: 11 }}>Από</div>
-            {usedGps ? (
-              <div style={{ color: TEXT }}>Η τρέχουσα θέση σου</div>
-            ) : (
-              <select value={fromIdx} onChange={e => reprice(Number(e.target.value), toIdx)} style={{ ...input, marginBottom: 0, fontSize: 12, padding: '6px 8px' }}>
-                {fromOpts.map((o, i) => <option key={i} value={i}>{o.label}</option>)}
-              </select>
-            )}
-          </div>
-
-          <div>
-            <div style={{ color: MUTE, fontSize: 11 }}>Προς</div>
-            <select value={toIdx} onChange={e => reprice(fromIdx, Number(e.target.value))} style={{ ...input, marginBottom: 0, fontSize: 12, padding: '6px 8px' }}>
-              {toOpts.map((o, i) => <option key={i} value={i}>{o.label}</option>)}
-            </select>
-          </div>
-
-          <div style={{ color: MUTE, fontSize: 11, marginTop: 8 }}>
-            Αν κάποιο σημείο είναι λάθος, διάλεξε άλλο από τη λίστα — η τιμή ξαναϋπολογίζεται αυτόματα. Μπορείς πάντα να γράψεις τιμή με το χέρι.
-          </div>
+          <div style={{ color: MUTE }}>Από: <span style={{ color: TEXT }}>{result.fromLabel}</span></div>
+          <div style={{ color: MUTE }}>Προς: <span style={{ color: TEXT }}>{result.toLabel}</span></div>
+          <div style={{ color: MUTE, marginTop: 6 }}>Μπορείς πάντα να αλλάξεις την τιμή με το χέρι.</div>
         </div>
       )}
     </div>
@@ -1298,7 +1319,9 @@ function BookingScreen({ state, driver, shift, onBack, onSubmit }) {
   const [customerName, setCustomerName] = useState('');
   const [passengers, setPassengers] = useState('1');
   const [pickup, setPickup] = useState('');
+  const [pickupPlaceId, setPickupPlaceId] = useState(null);
   const [destination, setDestination] = useState('');
+  const [destinationPlaceId, setDestinationPlaceId] = useState(null);
   const [price, setPrice] = useState('');
   const [paymentMethod, setPaymentMethod] = useState('cash'); // 'cash' | 'card' | 'app'
   const [notes, setNotes] = useState('');
@@ -1324,16 +1347,28 @@ function BookingScreen({ state, driver, shift, onBack, onSubmit }) {
       <label style={label}>Άτομα</label>
       <input type="number" min="1" value={passengers} onChange={e => setPassengers(e.target.value)} style={input} />
 
-      <label style={label}>Σημείο παραλαβής (προαιρετικό — αν το αφήσεις κενό, θα χρησιμοποιηθεί η τρέχουσα θέση σου)</label>
-      <input value={pickup} onChange={e => setPickup(e.target.value)} placeholder="π.χ. Αεροδρόμιο Μακεδονία" style={input} />
+      <AddressAutocomplete
+        label="Σημείο παραλαβής (προαιρετικό — αν το αφήσεις κενό, θα χρησιμοποιηθεί η τρέχουσα θέση σου)"
+        value={pickup}
+        onChange={setPickup}
+        onPick={setPickupPlaceId}
+        placeholder="π.χ. Αεροδρόμιο Μακεδονία"
+      />
 
-      <label style={label}>Προορισμός</label>
-      <input value={destination} onChange={e => setDestination(e.target.value)} placeholder="π.χ. Κέντρο" style={input} />
+      <AddressAutocomplete
+        label="Προορισμός"
+        value={destination}
+        onChange={setDestination}
+        onPick={setDestinationPlaceId}
+        placeholder="π.χ. Κέντρο"
+      />
 
       <FareCalculator
         fareSettings={state.fareSettings || { flagFall: 1.9, perKm: 1.65, minFare: 3.5 }}
         pickupText={pickup}
+        pickupPlaceId={pickupPlaceId}
         dropoffText={destination}
+        dropoffPlaceId={destinationPlaceId}
         useCurrentPositionAsPickup
         onPriceComputed={p => setPrice(String(p))}
       />
@@ -2839,6 +2874,8 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
   const [customerName, setCustomerName] = useState(appointment?.customerName || '');
   const [customerPhone, setCustomerPhone] = useState(appointment?.customerPhone || '');
   const [pickup, setPickup] = useState(appointment?.pickup || '');
+  const [pickupPlaceId, setPickupPlaceId] = useState(null);
+  const [dropoffPlaceId, setDropoffPlaceId] = useState(null);
   const [dropoff, setDropoff] = useState(appointment?.dropoff || '');
   const [driverId, setDriverId] = useState(appointment?.driverId || '');
   const [car, setCar] = useState(appointment?.car || '');
@@ -2943,21 +2980,28 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
           {[1, 2, 3, 4, 5, 6, 7, 8].map(n => <option key={n} value={n}>{n}</option>)}
         </select>
 
-        <div style={{ display: 'flex', gap: 10 }}>
-          <div style={{ flex: 1 }}>
-            <label style={label}>Παραλαβή</label>
-            <input value={pickup} onChange={e => setPickup(e.target.value)} style={input} placeholder="π.χ. Αεροδρόμιο" />
-          </div>
-          <div style={{ flex: 1 }}>
-            <label style={label}>Προορισμός</label>
-            <input value={dropoff} onChange={e => setDropoff(e.target.value)} style={input} placeholder="π.χ. Κέντρο" />
-          </div>
-        </div>
+        <AddressAutocomplete
+          label="Παραλαβή"
+          value={pickup}
+          onChange={setPickup}
+          onPick={setPickupPlaceId}
+          placeholder="π.χ. Αεροδρόμιο Μακεδονία"
+        />
+
+        <AddressAutocomplete
+          label="Προορισμός"
+          value={dropoff}
+          onChange={setDropoff}
+          onPick={setDropoffPlaceId}
+          placeholder="π.χ. Τσιμισκή 43, Θεσσαλονίκη"
+        />
 
         <FareCalculator
           fareSettings={state.fareSettings || { flagFall: 1.9, perKm: 1.65, minFare: 3.5 }}
           pickupText={pickup}
+          pickupPlaceId={pickupPlaceId}
           dropoffText={dropoff}
+          dropoffPlaceId={dropoffPlaceId}
           onPriceComputed={p => setPrice(String(p))}
         />
 
