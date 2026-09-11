@@ -1157,12 +1157,14 @@ const MINUTES_5 = ['00', '05', '10', '15', '20', '25', '30', '35', '40', '45', '
 function AddressAutocomplete({ label: fieldLabel, value, onChange, onPick, placeholder }) {
   const [suggestions, setSuggestions] = useState([]);
   const [open, setOpen] = useState(false);
+  const [lookupError, setLookupError] = useState('');
   const debounceRef = useRef(null);
 
   const handleChange = (text) => {
     onChange(text);
     onPick(null); // typing invalidates any previously picked place
     clearTimeout(debounceRef.current);
+    setLookupError('');
     if (!text || text.trim().length < 3) { setSuggestions([]); setOpen(false); return; }
     // Wait for a pause in typing — one lookup per pause instead of one per keystroke.
     debounceRef.current = setTimeout(async () => {
@@ -1170,8 +1172,12 @@ function AddressAutocomplete({ label: fieldLabel, value, onChange, onPick, place
         const list = await suggestAddresses(text);
         setSuggestions(list);
         setOpen(list.length > 0);
+        setLookupError(list.length === 0 ? 'Καμία πρόταση για αυτό το κείμενο' : '');
       } catch (e) {
+        // Show what actually went wrong — a silent empty list made a broken API key look
+        // identical to "no such address", which cost a lot of guessing.
         setSuggestions([]); setOpen(false);
+        setLookupError(e && e.message ? `Υπηρεσία διευθύνσεων: ${e.message}` : 'Η υπηρεσία διευθύνσεων δεν αποκρίθηκε');
       }
     }, 400);
   };
@@ -1186,6 +1192,7 @@ function AddressAutocomplete({ label: fieldLabel, value, onChange, onPick, place
         placeholder={placeholder}
         style={input}
       />
+      {lookupError && <div style={{ color: MUTE, fontSize: 11, marginTop: -12, marginBottom: 12 }}>{lookupError}</div>}
       {open && (
         <>
           <div onClick={() => setOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 39 }} />
