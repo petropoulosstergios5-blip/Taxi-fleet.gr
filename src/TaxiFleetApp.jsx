@@ -2056,11 +2056,44 @@ function AuditLogTab({ state }) {
   );
 }
 
+// Dark map styling so the map doesn't glare against the rest of the dark UI.
+const GMAP_DARK_STYLE = [
+  { elementType: 'geometry', stylers: [{ color: '#242f3e' }] },
+  { elementType: 'labels.text.stroke', stylers: [{ color: '#242f3e' }] },
+  { elementType: 'labels.text.fill', stylers: [{ color: '#746855' }] },
+  { featureType: 'poi', elementType: 'labels.text.fill', stylers: [{ color: '#d59563' }] },
+  { featureType: 'road', elementType: 'geometry', stylers: [{ color: '#38414e' }] },
+  { featureType: 'road', elementType: 'geometry.stroke', stylers: [{ color: '#212a37' }] },
+  { featureType: 'road', elementType: 'labels.text.fill', stylers: [{ color: '#9ca5b3' }] },
+  { featureType: 'road.highway', elementType: 'geometry', stylers: [{ color: '#746855' }] },
+  { featureType: 'road.highway', elementType: 'geometry.stroke', stylers: [{ color: '#1f2835' }] },
+  { featureType: 'road.highway', elementType: 'labels.text.fill', stylers: [{ color: '#f3d19c' }] },
+  { featureType: 'water', elementType: 'geometry', stylers: [{ color: '#17263c' }] },
+  { featureType: 'water', elementType: 'labels.text.fill', stylers: [{ color: '#515c6d' }] },
+];
+
+// Waits for the async Google Maps script to finish loading before the map is built.
+function useGoogleMapsReady() {
+  const [ready, setReady] = useState(() => !!(window.google && window.google.maps));
+  useEffect(() => {
+    if (ready) return;
+    const id = setInterval(() => {
+      if (window.google && window.google.maps) { setReady(true); clearInterval(id); }
+    }, 200);
+    // Give up after ~15s so a missing/blocked key shows a message instead of spinning forever.
+    const stop = setTimeout(() => clearInterval(id), 15000);
+    return () => { clearInterval(id); clearTimeout(stop); };
+  }, [ready]);
+  return ready;
+}
+
 function FleetMapTab({ state }) {
   const mapDivRef = useRef(null);
   const mapRef = useRef(null);
+  const infoRef = useRef(null);
   const markersRef = useRef({});
   const apptMarkersRef = useRef({});
+  const mapsReady = useGoogleMapsReady();
 
   const activeShifts = state.shifts.filter(s => s.status === 'active' && s.currentLocation);
   const positionsKey = activeShifts.map(s => `${s.id}:${s.currentLocation.lat.toFixed(5)}:${s.currentLocation.lng.toFixed(5)}`).join('|');
@@ -2072,55 +2105,95 @@ function FleetMapTab({ state }) {
   const apptsKey = pendingAppts.map(a => `${a.id}:${a.pickupLat}:${a.pickupLng}:${a.status}`).join('|');
 
   useEffect(() => {
-    if (!window.L || !mapDivRef.current || mapRef.current) return;
-    mapRef.current = window.L.map(mapDivRef.current).setView([40.6401, 22.9444], 12); // Θεσσαλονίκη ως προεπιλογή
-    window.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      attribution: '&copy; OpenStreetMap',
-      maxZoom: 19,
-    }).addTo(mapRef.current);
-  }, []);
+    if (!mapsReady || !mapDivRef.current || mapRef.current) return;
+    mapRef.current = new window.google.maps.Map(mapDivRef.current, {
+      center: { lat: 40.6401, lng: 22.9444 }, // Θεσσαλονίκη ως προεπιλογή
+      zoom: 12,
+      styles: GMAP_DARK_STYLE,
+      mapTypeControl: false,
+      streetViewControl: false,
+      fullscreenControl: true,
+    });
+    infoRef.current = new window.google.maps.InfoWindow();
+  }, [mapsReady]);
 
+  // Vehicle markers
   useEffect(() => {
-    if (!mapRef.current || !window.L) return;
+    if (!mapRef.current) return;
+    const g = window.google.maps;
     const liveIds = new Set(activeShifts.map(s => s.id));
     Object.keys(markersRef.current).forEach(id => {
-      if (!liveIds.has(id)) { mapRef.current.removeLayer(markersRef.current[id]); delete markersRef.current[id]; }
+      if (!liveIds.has(id)) { markersRef.current[id].setMap(null); delete markersRef.current[id]; }
     });
-    const pts = [];
+    const bounds = new g.LatLngBounds();
+    let any = false;
     activeShifts.forEach(s => {
       const driver = state.drivers.find(d => d.id === s.driverId);
       const { lat, lng, at } = s.currentLocation;
-      pts.push([lat, lng]);
+      const pos = { lat, lng };
+      bounds.extend(pos); any = true;
       const ageMin = Math.max(0, Math.round((Date.now() - new Date(at).getTime()) / 60000));
-      const html = `<b>${carLabelById(state, s.car)}</b><br/>${driver?.name || ''}<br/>ενημέρωση πριν ${ageMin} λεπτά`;
+      const html = `<div style="color:#111;font-size:13px"><b>${carLabelById(state, s.car)}</b><br/>${driver?.name || ''}<br/>ενημέρωση πριν ${ageMin} λεπτά</div>`;
       if (markersRef.current[s.id]) {
-        markersRef.current[s.id].setLatLng([lat, lng]).setPopupContent(html);
+        markersRef.current[s.id].setPosition(pos);
+        markersRef.current[s.id].infoHtml = html;
       } else {
-        markersRef.current[s.id] = window.L.marker([lat, lng]).addTo(mapRef.current).bindPopup(html);
+        const marker = new g.Marker({
+          position: pos, map: mapRef.current, title: carLabelById(state, s.car),
+          icon: {
+            path: g.SymbolPath.CIRCLE, scale: 9,
+            fillColor: '#3388ff', fillOpacity: 1, strokeColor: '#ffffff', strokeWeight: 2,
+          },
+        });
+        marker.infoHtml = html;
+        marker.addListener('click', () => {
+          infoRef.current.setContent(marker.infoHtml);
+          infoRef.current.open({ anchor: marker, map: mapRef.current });
+        });
+        markersRef.current[s.id] = marker;
       }
     });
-    if (pts.length > 0) mapRef.current.fitBounds(pts, { maxZoom: 15, padding: [30, 30] });
-  }, [positionsKey]);
+    if (any) {
+      mapRef.current.fitBounds(bounds, 40);
+      // fitBounds on a single point zooms in absurdly far — cap it.
+      const once = window.google.maps.event.addListenerOnce(mapRef.current, 'idle', () => {
+        if (mapRef.current.getZoom() > 15) mapRef.current.setZoom(15);
+      });
+      return () => window.google.maps.event.removeListener(once);
+    }
+  }, [positionsKey, mapsReady]);
 
+  // Appointment pickup markers
   useEffect(() => {
-    if (!mapRef.current || !window.L) return;
+    if (!mapRef.current) return;
+    const g = window.google.maps;
     const liveIds = new Set(pendingAppts.map(a => a.id));
     Object.keys(apptMarkersRef.current).forEach(id => {
-      if (!liveIds.has(id)) { mapRef.current.removeLayer(apptMarkersRef.current[id]); delete apptMarkersRef.current[id]; }
+      if (!liveIds.has(id)) { apptMarkersRef.current[id].setMap(null); delete apptMarkersRef.current[id]; }
     });
     pendingAppts.forEach(a => {
       const driver = state.drivers.find(d => d.id === a.driverId);
       const meta = STATUS_META[a.status] || STATUS_META.pending;
-      const html = `✈ <b>${a.customerName}</b><br/>${a.time} · ${a.pickup}<br/>${driver ? driver.name : 'Χωρίς ανάθεση'}<br/><span style="color:${meta.color}">${meta.label}</span>`;
+      const html = `<div style="color:#111;font-size:13px">✈ <b>${a.customerName}</b><br/>${a.time} · ${a.pickup || ''}<br/>${driver ? driver.name : 'Χωρίς ανάθεση'}<br/><span style="color:${meta.color}">${meta.label}</span></div>`;
       if (apptMarkersRef.current[a.id]) {
-        apptMarkersRef.current[a.id].setPopupContent(html);
+        apptMarkersRef.current[a.id].infoHtml = html;
       } else {
-        apptMarkersRef.current[a.id] = window.L.circleMarker([a.pickupLat, a.pickupLng], {
-          radius: 9, color: '#F5B942', weight: 2, fillColor: '#F5B942', fillOpacity: 0.85,
-        }).addTo(mapRef.current).bindPopup(html);
+        const marker = new g.Marker({
+          position: { lat: a.pickupLat, lng: a.pickupLng }, map: mapRef.current, title: a.customerName,
+          icon: {
+            path: g.SymbolPath.CIRCLE, scale: 8,
+            fillColor: '#F5B942', fillOpacity: 0.95, strokeColor: '#ffffff', strokeWeight: 2,
+          },
+        });
+        marker.infoHtml = html;
+        marker.addListener('click', () => {
+          infoRef.current.setContent(marker.infoHtml);
+          infoRef.current.open({ anchor: marker, map: mapRef.current });
+        });
+        apptMarkersRef.current[a.id] = marker;
       }
     });
-  }, [apptsKey]);
+  }, [apptsKey, mapsReady]);
 
   return (
     <div>
@@ -2133,6 +2206,11 @@ function FleetMapTab({ state }) {
       {activeShifts.length === 0 && pendingAppts.length === 0 && (
         <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 12, padding: 16, color: MUTE, fontSize: 13, marginBottom: 12 }}>
           Κανένα ενεργό όχημα ή εκκρεμές ραντεβού αυτή τη στιγμή.
+        </div>
+      )}
+      {!mapsReady && (
+        <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 12, padding: 16, color: MUTE, fontSize: 13, marginBottom: 12 }}>
+          Φόρτωση χάρτη… Αν δεν εμφανιστεί, έλεγξε ότι το κλειδί χάρτη (browser key) έχει μπει στο index.html και ότι το Maps JavaScript API είναι ενεργοποιημένο.
         </div>
       )}
       <div ref={mapDivRef} style={{ width: '100%', height: 440, borderRadius: 12, overflow: 'hidden', border: `1px solid ${BORDER}` }} />
