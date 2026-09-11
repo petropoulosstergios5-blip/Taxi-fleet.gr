@@ -8,8 +8,23 @@
     <meta name="theme-color" content="#1C2128" />
     <link rel="icon" href="/icon-192.png" />
     <link rel="apple-touch-icon" href="/icon-192.png" />
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <!--
+      Google Maps JavaScript API.
+
+      IMPORTANT — replace YOUR_BROWSER_KEY_HERE with your *browser* Maps key.
+      This key is necessarily visible in the page source (the map is drawn in the
+      browser, so it cannot be proxied through our server the way the Places/Routes
+      key is). Protect it in Google Cloud instead:
+        Credentials -> that key -> Application restrictions -> Websites, and allow only:
+            https://taxi-fleet-gr.vercel.app/*
+        API restrictions -> Restrict key -> Maps JavaScript API only
+      With those two restrictions the key is useless to anyone else.
+      Use a SEPARATE key from the server one in maps-proxy (that one must stay secret).
+    -->
+    <script
+      src="https://maps.googleapis.com/maps/api/js?key=AIzaSyD7pXKRBiCTlCmoYVjSeFW_mT9fADPRNiQ&language=el&region=GR&loading=async"
+      async defer
+    ></script>
     <style>
       html, body { background: #1C2128; overflow-x: hidden; max-width: 100vw; }
       * { box-sizing: border-box; }
