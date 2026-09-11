@@ -2,13 +2,12 @@ import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { createClient } from '@supabase/supabase-js';
 import { Car, Clock, MapPin, Fuel, AlertCircle, CheckCircle2, Plus, X, ChevronRight, Navigation, Calendar, User, LogOut, Gauge, Wallet, ArrowLeft, Lock, Camera, CreditCard, Banknote, Smartphone, Plane, Users, Unlock, Filter, XCircle, PlayCircle, Flag, Eye, EyeOff, MessageCircle } from 'lucide-react';
 
-// --- Runtime configuration ---
-// The browser key may be public, but MUST be restricted in Google Cloud to this app's
-// HTTPS origins and to Maps JavaScript API only. Routes/Places keys never reach the browser.
-const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
-const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
-const GOOGLE_MAPS_BROWSER_KEY = import.meta.env.VITE_GOOGLE_MAPS_BROWSER_KEY;
-if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error('Missing VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY');
+// --- Supabase (cloud sync) ---
+// Publishable/anon keys are meant to be embedded in client code — that's how Supabase works.
+// Real security (who can log in as what) still happens only in this app's own login screen,
+// not via Supabase Auth. Anyone with this key can read/write the single shared row below.
+const SUPABASE_URL = 'https://whecwstuqlyohbvuvfkp.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_ZhFFRNTKncvML6BBK_j2pA_opwKSVGA';
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const ROW_ID = 'main'; // single shared state row
 const VAPID_PUBLIC_KEY = 'BKn1btEuoRmHeZAA2jfdHvNphTRjT2wuGKCudYv0KIOTMs_Jtq3T00wc7XjUSJBngMEVxPoTvfdVZYUjhk7Yc1I';
@@ -21,36 +20,6 @@ function urlBase64ToUint8Array(base64String) {
   return outputArray;
 }
 const POLL_MS = 8000; // how often other devices' changes get picked up
-
-// All costly/sensitive Google calls are proxied by Supabase Edge Function `maps`.
-// It also applies timeouts, retries and server-side validation.
-async function mapsRequest(action, payload, signal) {
-  const { data: { session } } = await supabase.auth.getSession();
-  const res = await fetch(`${SUPABASE_URL}/functions/v1/maps`, {
-    method: 'POST', signal,
-    headers: { 'Content-Type': 'application/json', apikey: SUPABASE_ANON_KEY, ...(session?.access_token ? { Authorization: `Bearer ${session.access_token}` } : {}) },
-    body: JSON.stringify({ action, ...payload }),
-  });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || 'Η υπηρεσία χαρτών δεν αποκρίθηκε');
-  return body;
-}
-
-let googleMapsPromise;
-function loadGoogleMaps() {
-  if (window.google?.maps) return Promise.resolve(window.google.maps);
-  if (googleMapsPromise) return googleMapsPromise;
-  if (!GOOGLE_MAPS_BROWSER_KEY) return Promise.reject(new Error('Missing VITE_GOOGLE_MAPS_BROWSER_KEY'));
-  googleMapsPromise = new Promise((resolve, reject) => {
-    const script = document.createElement('script');
-    script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(GOOGLE_MAPS_BROWSER_KEY)}&v=weekly&language=el&region=GR`;
-    script.async = true; script.defer = true;
-    script.onload = () => resolve(window.google.maps);
-    script.onerror = () => reject(new Error('Αδυναμία φόρτωσης Google Maps'));
-    document.head.appendChild(script);
-  });
-  return googleMapsPromise;
-}
 
 const KEY = 'taxifleet:state:v3'; // fallback localStorage key, used only if cloud is unreachable
 
@@ -144,7 +113,7 @@ const initialState = {
   tameioAdjustments: [], // manual driver cash-float corrections: {id, driverId, amount (negative to subtract), reason, at (ISO)}
   auditLog: [], // {id, at (ISO), actor, action} — who changed what, when. Capped at the most recent 500 entries.
   messages: [], // 1:1 chat threads between admin and each driver: {id, driverId, sender:'admin'|'driver', text, at, readByAdmin, readByDriver}
-  fareSettings: { flagFall: 1.90, perKm: 1.65, perMinute: 0, minFare: 3.50 }, // admin-configurable snapshot stored per route
+  fareSettings: { flagFall: 1.90, perKm: 1.65, minFare: 3.50 }, // admin-configurable, used only as a starting suggestion
 };
 
 const fontStack = { fontFamily: 'Inter, system-ui, sans-serif' };
@@ -291,32 +260,73 @@ async function applyAppointmentPatch(state, persist, appointment, patch, actor) 
   await persist(nextState);
 }
 
-// Google Places autocomplete is served by the Edge Function. Every accepted result has a
-// stable Place ID and coordinates; free text is never sent straight to routing.
-async function searchAddresses(address) {
-  if (!address || !address.trim()) return [];
-  const response = await mapsRequest('autocomplete', { input: address.trim() });
-  return response.places || [];
+// Address lookup + routing via Google Maps Platform, proxied through our own Edge
+// Function. The API key deliberately lives server-side: embedding it in the app bundle
+// would let anyone read it from the page source and spend against the billing account.
+const MAPS_PROXY_URL = `${SUPABASE_URL}/functions/v1/maps-proxy`;
+const placeCache = new Map();
+
+async function mapsProxy(payload) {
+  const res = await fetch(MAPS_PROXY_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (data.error) {
+    const err = new Error(data.error);
+    err.fromMaps = true;
+    throw err;
+  }
+  return data;
 }
 
-// Convenience wrapper for background use (map pins) where there's no UI to choose from.
+// Type-ahead suggestions. Returns [{placeId, label}] — coordinates are fetched later,
+// only for the one the user actually picks, which keeps API usage (and cost) minimal.
+async function suggestAddresses(text) {
+  if (!text || text.trim().length < 3) return [];
+  const { suggestions } = await mapsProxy({ action: 'autocomplete', text: text.trim() });
+  return suggestions || [];
+}
+
+// Resolves a suggestion the user picked into real coordinates.
+async function resolvePlace(placeId) {
+  if (placeCache.has(placeId)) return placeCache.get(placeId);
+  const place = await mapsProxy({ action: 'details', placeId });
+  placeCache.set(placeId, place);
+  return place;
+}
+
+// Fallback for free-typed text that was never picked from the suggestion list.
 async function geocodeAddress(address) {
-  const results = await searchAddresses(address);
-  return results[0] || null;
-}
-
-// Computes driving distance and fare between two ALREADY-RESOLVED points. Address
-// resolution now happens in the UI (so the user can see and correct what was matched)
-// rather than silently in here.
-async function computeFareBetween(from, to, fareSettings) {
+  if (!address || !address.trim()) return null;
+  const key = 'q:' + address.trim().toLowerCase();
+  if (placeCache.has(key)) return placeCache.get(key);
   try {
-    const route = await mapsRequest('route', { origin: from, destination: to, fareSettings });
-    return { ok: true, ...route, km: route.distanceMeters / 1000, price: route.fare.estimatedFare };
+    const place = await mapsProxy({ action: 'geocode', text: address.trim() });
+    placeCache.set(key, place);
+    return place;
   } catch (e) {
-    console.error('computeFareBetween routing failed:', e);
-    return { ok: false, reason: 'Η υπηρεσία διαδρομών δεν αποκρίθηκε' };
+    console.error('geocodeAddress failed (non-fatal):', e);
+    return null;
   }
 }
+
+// Driving distance between two resolved points, then the admin's tariff applied on top.
+async function computeFareBetween(from, to, fareSettings) {
+  try {
+    const { meters } = await mapsProxy({ action: 'route', from, to });
+    if (meters == null) return { ok: false, reason: 'Δεν βρέθηκε διαδρομή ανάμεσα στα δύο σημεία' };
+    const km = meters / 1000;
+    const raw = (fareSettings.flagFall || 0) + km * (fareSettings.perKm || 0);
+    const price = Math.max(raw, fareSettings.minFare || 0);
+    return { ok: true, km, price: Math.round(price * 100) / 100 };
+  } catch (e) {
+    console.error('computeFareBetween failed:', e);
+    return { ok: false, reason: e.fromMaps ? e.message : 'Η υπηρεσία διαδρομών δεν αποκρίθηκε' };
+  }
+}
+
 
 function checkAppointmentConflict({ appointments, shifts, cars }, { date, time, durationMin, driverId, car, excludeId }) {
   const newRange = apptRange({ time, durationMin });
@@ -773,9 +783,9 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
     try { localStorage.setItem(`taxifleet:notifiedmsg:${driverId}`, JSON.stringify([...notifiedMsgRef.current])); } catch (e) {}
   }, [state.messages, driverId, notifPermission]);
 
-  // Legacy app_state is retained for compatibility; production locations go to the
-  // dedicated table, which admins receive over Supabase Realtime. A native driver client
-  // must replace this foreground-only browser loop for background tracking.
+  // Live location — only while the app is open in the foreground and a shift is active.
+  // A ref holds the latest state so the interval always writes on top of current data,
+  // not a stale snapshot from when the effect first ran.
   const stateRef = useRef(state);
   useEffect(() => { stateRef.current = state; }, [state]);
   useEffect(() => {
@@ -787,14 +797,9 @@ function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
       const cur = stateRef.current;
       const shiftNow = cur.shifts.find(s => s.id === activeShift.id);
       if (!shiftNow || shiftNow.status !== 'active') return;
-      const { error: locationError } = await supabase.from('driver_live_locations').upsert({
-        driver_id: driverId, latitude: pos.lat, longitude: pos.lng, heading: pos.heading,
-        speed_mps: pos.speed, accuracy_m: pos.accuracy, recorded_at: pos.at,
-      });
-      if (locationError) console.warn('Dedicated live-location write failed (legacy fallback remains):', locationError.message);
       await persist({
         ...cur,
-        shifts: cur.shifts.map(s => s.id === activeShift.id ? { ...s, currentLocation: pos } : s),
+        shifts: cur.shifts.map(s => s.id === activeShift.id ? { ...s, currentLocation: { lat: pos.lat, lng: pos.lng, at: pos.at } } : s),
       });
     };
     tick();
@@ -1082,9 +1087,9 @@ function captureGPS() {
   return new Promise((resolve) => {
     if (!navigator.geolocation) return resolve(null);
     navigator.geolocation.getCurrentPosition(
-      pos => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude, heading: pos.coords.heading ?? null, speed: pos.coords.speed ?? null, accuracy: pos.coords.accuracy ?? null, at: new Date().toISOString() }),
+      pos => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude, at: new Date().toISOString() }),
       () => resolve(null),
-      { enableHighAccuracy: true, maximumAge: 5000, timeout: 10000 }
+      { timeout: 5000 }
     );
   });
 }
@@ -1146,86 +1151,103 @@ function StartShiftScreen({ state, driver, cars, activeShifts, onBack, onSubmit 
 // guarantee a 24-hour display everywhere, on every phone.
 const HOURS_24 = Array.from({ length: 24 }, (_, i) => String(i).padStart(2, '0'));
 const MINUTES_5 = ['00', '05', '10', '15', '20', '25', '30', '35', '40', '45', '50', '55'];
-// Shared fare calculator. Resolves both addresses, SHOWS what it actually matched, and
-// lets the user swap in a different candidate — the previous silent "first result wins"
-// behaviour is what produced wrong prices without any visible warning.
-function GooglePinPicker({ onPick, onCancel }) {
-  const ref = useRef(null);
-  const marker = useRef(null);
-  useEffect(() => {
-    let map;
-    loadGoogleMaps().then(maps => {
-      if (!ref.current) return;
-      map = new maps.Map(ref.current, { center: { lat: 40.6401, lng: 22.9444 }, zoom: 13, gestureHandling: 'greedy' });
-      map.addListener('click', e => {
-        const point = { lat: e.latLng.lat(), lng: e.latLng.lng(), label: `Σημείο στον χάρτη (${e.latLng.lat().toFixed(5)}, ${e.latLng.lng().toFixed(5)})`, placeId: null };
-        marker.current?.setMap(null); marker.current = new maps.Marker({ map, position: point }); onPick(point);
-      });
-    });
-    return () => { marker.current?.setMap(null); };
-  }, []);
-  return <div style={{ marginBottom: 10, border: `1px solid ${ACCENT}`, borderRadius: 10, overflow: 'hidden' }}><div style={{ padding: '8px 10px', color: TEXT, fontSize: 12 }}>Πάτησε στο ακριβές σημείο στον χάρτη και μετά υπολόγισε ξανά.</div><div ref={ref} style={{ height: 240 }} /><button onClick={onCancel} style={{ ...smallBtn(MUTE), margin: 8 }}>Κλείσιμο</button></div>;
+// An address field with Google-powered type-ahead. Picking a suggestion locks in an exact
+// place (no guessing), which is what makes the fare reliable. Free-typed text still works
+// as a fallback — it just gets geocoded on a best-effort basis.
+function AddressAutocomplete({ label: fieldLabel, value, onChange, onPick, placeholder }) {
+  const [suggestions, setSuggestions] = useState([]);
+  const [open, setOpen] = useState(false);
+  const debounceRef = useRef(null);
+
+  const handleChange = (text) => {
+    onChange(text);
+    onPick(null); // typing invalidates any previously picked place
+    clearTimeout(debounceRef.current);
+    if (!text || text.trim().length < 3) { setSuggestions([]); setOpen(false); return; }
+    // Wait for a pause in typing — one lookup per pause instead of one per keystroke.
+    debounceRef.current = setTimeout(async () => {
+      try {
+        const list = await suggestAddresses(text);
+        setSuggestions(list);
+        setOpen(list.length > 0);
+      } catch (e) {
+        setSuggestions([]); setOpen(false);
+      }
+    }, 400);
+  };
+
+  return (
+    <div style={{ position: 'relative' }}>
+      <label style={label}>{fieldLabel}</label>
+      <input
+        value={value}
+        onChange={e => handleChange(e.target.value)}
+        onFocus={() => suggestions.length > 0 && setOpen(true)}
+        placeholder={placeholder}
+        style={input}
+      />
+      {open && (
+        <>
+          <div onClick={() => setOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 39 }} />
+          <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, marginTop: -10, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, zIndex: 40, overflow: 'hidden', boxShadow: '0 8px 24px rgba(0,0,0,0.4)' }}>
+            {suggestions.map(s => (
+              <button
+                key={s.placeId}
+                onClick={() => { onChange(s.label); onPick(s.placeId); setOpen(false); setSuggestions([]); }}
+                style={{ display: 'block', width: '100%', textAlign: 'left', background: 'none', border: 'none', borderBottom: `1px solid ${BORDER}`, color: TEXT, padding: '10px 12px', fontSize: 13, cursor: 'pointer' }}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
 }
 
-function FareCalculator({ fareSettings, pickupText, dropoffText, useCurrentPositionAsPickup, onPriceComputed, onRouteComputed }) {
+// Shared fare calculator. Works off exact places when the user picked from the
+// suggestions, and falls back to geocoding free text otherwise.
+function FareCalculator({ fareSettings, pickupText, pickupPlaceId, dropoffText, dropoffPlaceId, useCurrentPositionAsPickup, onPriceComputed }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const [fromOpts, setFromOpts] = useState([]);
-  const [toOpts, setToOpts] = useState([]);
-  const [fromIdx, setFromIdx] = useState(0);
-  const [toIdx, setToIdx] = useState(0);
-  const [result, setResult] = useState(null); // {km, price}
-  const [usedGps, setUsedGps] = useState(false);
-  const [manualFrom, setManualFrom] = useState(null);
-  const [manualTo, setManualTo] = useState(null);
-  const [picking, setPicking] = useState(null);
+  const [result, setResult] = useState(null); // {km, price, fromLabel, toLabel}
 
-  const priceFor = async (from, to) => {
-    const res = await computeFareBetween(from, to, fareSettings);
-    if (!res.ok) { setError(res.reason); setResult(null); return; }
-    setError('');
-    setResult({ km: res.km, price: res.price });
-    onPriceComputed(res.price);
-    onRouteComputed?.({
-      pickup: from, destination: to, distanceMeters: res.distanceMeters, durationSeconds: res.durationSeconds,
-      durationInTrafficSeconds: res.durationInTrafficSeconds || null, routePolyline: res.polyline || null,
-      fare: res.fare, calculatedAt: new Date().toISOString(),
-    });
+  const resolveEnd = async (text, placeId) => {
+    if (placeId) return await resolvePlace(placeId);
+    return await geocodeAddress(text);
   };
 
   const run = async () => {
-    setBusy(true); setError(''); setResult(null); setUsedGps(false);
-    let fromList = [];
-    if (manualFrom) {
-      fromList = [manualFrom];
-    } else if (pickupText && pickupText.trim()) {
-      fromList = await searchAddresses(pickupText);
-      if (fromList.length === 0) { setError('Δεν βρέθηκε η διεύθυνση παραλαβής — δοκίμασε πιο συγκεκριμένα (οδό + αριθμό + περιοχή)'); setBusy(false); setFromOpts([]); setToOpts([]); return; }
-    } else if (useCurrentPositionAsPickup) {
-      const here = await captureGPS();
-      if (!here) { setError('Δεν πήρα τη θέση σου (GPS) — γράψε σημείο παραλαβής'); setBusy(false); return; }
-      fromList = [{ ...here, label: 'Η τρέχουσα θέση σου' }];
-      setUsedGps(true);
-    } else {
-      setError('Συμπλήρωσε σημείο παραλαβής'); setBusy(false); return;
+    setBusy(true); setError(''); setResult(null);
+    try {
+      let from, fromLabel;
+      if (pickupText && pickupText.trim()) {
+        from = await resolveEnd(pickupText, pickupPlaceId);
+        if (!from) { setError('Δεν βρέθηκε η διεύθυνση παραλαβής — διάλεξε μία από τις προτάσεις καθώς πληκτρολογείς'); setBusy(false); return; }
+        fromLabel = from.label;
+      } else if (useCurrentPositionAsPickup) {
+        const here = await captureGPS();
+        if (!here) { setError('Δεν πήρα τη θέση σου (GPS) — γράψε σημείο παραλαβής'); setBusy(false); return; }
+        from = here; fromLabel = 'Η τρέχουσα θέση σου';
+      } else {
+        setError('Συμπλήρωσε σημείο παραλαβής'); setBusy(false); return;
+      }
+
+      const to = await resolveEnd(dropoffText, dropoffPlaceId);
+      if (!to) { setError('Δεν βρέθηκε ο προορισμός — διάλεξε μία από τις προτάσεις καθώς πληκτρολογείς'); setBusy(false); return; }
+
+      const res = await computeFareBetween(from, to, fareSettings);
+      if (!res.ok) { setError(res.reason); setBusy(false); return; }
+      setResult({ km: res.km, price: res.price, fromLabel, toLabel: to.label });
+      onPriceComputed(res.price);
+    } catch (e) {
+      setError(e.fromMaps ? e.message : 'Η υπηρεσία χαρτών δεν αποκρίθηκε — ξαναδοκίμασε σε λίγο.');
     }
-
-    const toList = manualTo ? [manualTo] : await searchAddresses(dropoffText);
-    if (toList.length === 0) { setError('Δεν βρέθηκε ο προορισμός — δοκίμασε πιο συγκεκριμένα (οδό + αριθμό + περιοχή)'); setBusy(false); setFromOpts(fromList); setToOpts([]); return; }
-
-    setFromOpts(fromList); setToOpts(toList); setFromIdx(0); setToIdx(0);
-    await priceFor(fromList[0], toList[0]);
     setBusy(false);
   };
 
-  const reprice = async (fi, ti) => {
-    setFromIdx(fi); setToIdx(ti);
-    setBusy(true);
-    await priceFor(fromOpts[fi], toOpts[ti]);
-    setBusy(false);
-  };
-
-  const canRun = (!!dropoffText || !!manualTo) && (!!pickupText || !!manualFrom || useCurrentPositionAsPickup);
+  const canRun = !!dropoffText && (!!pickupText || useCurrentPositionAsPickup);
 
   return (
     <div style={{ marginBottom: 16 }}>
@@ -1236,42 +1258,17 @@ function FareCalculator({ fareSettings, pickupText, dropoffText, useCurrentPosit
       >
         {busy ? 'Υπολογισμός...' : '🧮 Υπολογισμός τιμής'}
       </button>
-      <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
-        <button onClick={() => setPicking('from')} style={smallBtn(MUTE)}>📍 Pin παραλαβής</button>
-        <button onClick={() => setPicking('to')} style={smallBtn(MUTE)}>📍 Pin προορισμού</button>
-      </div>
-      {picking && <GooglePinPicker onPick={point => { if (picking === 'from') setManualFrom(point); else setManualTo(point); setPicking(null); }} onCancel={() => setPicking(null)} />}
 
       {error && <div style={{ color: RED, fontSize: 12, marginBottom: 8 }}>✗ {error}</div>}
 
       {result && (
         <div style={{ background: 'rgba(74,155,110,0.10)', border: `1px solid ${GREEN}`, borderRadius: 10, padding: 12, fontSize: 12 }}>
-          <div style={{ color: GREEN, fontWeight: 700, marginBottom: 8 }}>
+          <div style={{ color: GREEN, fontWeight: 700, marginBottom: 6 }}>
             {result.km.toFixed(1)} χλμ · προτεινόμενη τιμή {fmtEUR(result.price)}
           </div>
-          <div style={{ color: MUTE, marginBottom: 6 }}>Έλεγξε ότι βρήκε τα σωστά σημεία:</div>
-
-          <div style={{ marginBottom: 6 }}>
-            <div style={{ color: MUTE, fontSize: 11 }}>Από</div>
-            {usedGps ? (
-              <div style={{ color: TEXT }}>Η τρέχουσα θέση σου</div>
-            ) : (
-              <select value={fromIdx} onChange={e => reprice(Number(e.target.value), toIdx)} style={{ ...input, marginBottom: 0, fontSize: 12, padding: '6px 8px' }}>
-                {fromOpts.map((o, i) => <option key={i} value={i}>{o.label}</option>)}
-              </select>
-            )}
-          </div>
-
-          <div>
-            <div style={{ color: MUTE, fontSize: 11 }}>Προς</div>
-            <select value={toIdx} onChange={e => reprice(fromIdx, Number(e.target.value))} style={{ ...input, marginBottom: 0, fontSize: 12, padding: '6px 8px' }}>
-              {toOpts.map((o, i) => <option key={i} value={i}>{o.label}</option>)}
-            </select>
-          </div>
-
-          <div style={{ color: MUTE, fontSize: 11, marginTop: 8 }}>
-            Αν κάποιο σημείο είναι λάθος, διάλεξε άλλο από τη λίστα — η τιμή ξαναϋπολογίζεται αυτόματα. Μπορείς πάντα να γράψεις τιμή με το χέρι.
-          </div>
+          <div style={{ color: MUTE }}>Από: <span style={{ color: TEXT }}>{result.fromLabel}</span></div>
+          <div style={{ color: MUTE }}>Προς: <span style={{ color: TEXT }}>{result.toLabel}</span></div>
+          <div style={{ color: MUTE, marginTop: 6 }}>Μπορείς πάντα να αλλάξεις την τιμή με το χέρι.</div>
         </div>
       )}
     </div>
@@ -1322,7 +1319,9 @@ function BookingScreen({ state, driver, shift, onBack, onSubmit }) {
   const [customerName, setCustomerName] = useState('');
   const [passengers, setPassengers] = useState('1');
   const [pickup, setPickup] = useState('');
+  const [pickupPlaceId, setPickupPlaceId] = useState(null);
   const [destination, setDestination] = useState('');
+  const [destinationPlaceId, setDestinationPlaceId] = useState(null);
   const [price, setPrice] = useState('');
   const [paymentMethod, setPaymentMethod] = useState('cash'); // 'cash' | 'card' | 'app'
   const [notes, setNotes] = useState('');
@@ -1348,16 +1347,28 @@ function BookingScreen({ state, driver, shift, onBack, onSubmit }) {
       <label style={label}>Άτομα</label>
       <input type="number" min="1" value={passengers} onChange={e => setPassengers(e.target.value)} style={input} />
 
-      <label style={label}>Σημείο παραλαβής (προαιρετικό — αν το αφήσεις κενό, θα χρησιμοποιηθεί η τρέχουσα θέση σου)</label>
-      <input value={pickup} onChange={e => setPickup(e.target.value)} placeholder="π.χ. Αεροδρόμιο Μακεδονία" style={input} />
+      <AddressAutocomplete
+        label="Σημείο παραλαβής (προαιρετικό — αν το αφήσεις κενό, θα χρησιμοποιηθεί η τρέχουσα θέση σου)"
+        value={pickup}
+        onChange={setPickup}
+        onPick={setPickupPlaceId}
+        placeholder="π.χ. Αεροδρόμιο Μακεδονία"
+      />
 
-      <label style={label}>Προορισμός</label>
-      <input value={destination} onChange={e => setDestination(e.target.value)} placeholder="π.χ. Κέντρο" style={input} />
+      <AddressAutocomplete
+        label="Προορισμός"
+        value={destination}
+        onChange={setDestination}
+        onPick={setDestinationPlaceId}
+        placeholder="π.χ. Κέντρο"
+      />
 
       <FareCalculator
         fareSettings={state.fareSettings || { flagFall: 1.9, perKm: 1.65, minFare: 3.5 }}
         pickupText={pickup}
+        pickupPlaceId={pickupPlaceId}
         dropoffText={destination}
+        dropoffPlaceId={destinationPlaceId}
         useCurrentPositionAsPickup
         onPriceComputed={p => setPrice(String(p))}
       />
@@ -1889,7 +1900,7 @@ function AdminApp({ state, persist, onLogout, cloudStatus }) {
   );
 }
 
-// ---------- Χάρτης στόλου (Google Maps) ----------
+// ---------- Χάρτης στόλου (ζωντανές θέσεις, OpenStreetMap — χωρίς κλειδί API) ----------
 function ChatThread({ state, persist, driverId, viewerRole, onBack }) {
   const [text, setText] = useState('');
   const bottomRef = useRef(null);
@@ -2043,22 +2054,8 @@ function FleetMapTab({ state }) {
   const mapRef = useRef(null);
   const markersRef = useRef({});
   const apptMarkersRef = useRef({});
-  const [mapError, setMapError] = useState('');
-  const [realtimeLocations, setRealtimeLocations] = useState({});
 
-  useEffect(() => {
-    let mounted = true;
-    supabase.from('driver_live_locations').select('*').then(({ data }) => {
-      if (mounted && data) setRealtimeLocations(Object.fromEntries(data.map(r => [r.driver_id, { lat: r.latitude, lng: r.longitude, heading: r.heading, speed: r.speed_mps, accuracy: r.accuracy_m, at: r.recorded_at }])));
-    });
-    const channel = supabase.channel('fleet-live-locations').on('postgres_changes', { event: '*', schema: 'public', table: 'driver_live_locations' }, payload => {
-      const row = payload.new;
-      if (row?.driver_id) setRealtimeLocations(prev => ({ ...prev, [row.driver_id]: { lat: row.latitude, lng: row.longitude, heading: row.heading, speed: row.speed_mps, accuracy: row.accuracy_m, at: row.recorded_at } }));
-    }).subscribe();
-    return () => { mounted = false; supabase.removeChannel(channel); };
-  }, []);
-
-  const activeShifts = state.shifts.filter(s => s.status === 'active' && (realtimeLocations[s.driverId] || s.currentLocation)).map(s => ({ ...s, currentLocation: realtimeLocations[s.driverId] || s.currentLocation }));
+  const activeShifts = state.shifts.filter(s => s.status === 'active' && s.currentLocation);
   const positionsKey = activeShifts.map(s => `${s.id}:${s.currentLocation.lat.toFixed(5)}:${s.currentLocation.lng.toFixed(5)}`).join('|');
 
   const todayIso = isoDateStr(new Date());
@@ -2068,20 +2065,19 @@ function FleetMapTab({ state }) {
   const apptsKey = pendingAppts.map(a => `${a.id}:${a.pickupLat}:${a.pickupLng}:${a.status}`).join('|');
 
   useEffect(() => {
-    let cancelled = false;
-    loadGoogleMaps().then(maps => {
-      if (!cancelled && mapDivRef.current && !mapRef.current) {
-        mapRef.current = new maps.Map(mapDivRef.current, { center: { lat: 40.6401, lng: 22.9444 }, zoom: 12, mapId: import.meta.env.VITE_GOOGLE_MAP_ID || undefined, gestureHandling: 'greedy' });
-      }
-    }).catch(e => setMapError(e.message));
-    return () => { cancelled = true; };
+    if (!window.L || !mapDivRef.current || mapRef.current) return;
+    mapRef.current = window.L.map(mapDivRef.current).setView([40.6401, 22.9444], 12); // Θεσσαλονίκη ως προεπιλογή
+    window.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap',
+      maxZoom: 19,
+    }).addTo(mapRef.current);
   }, []);
 
   useEffect(() => {
-    if (!mapRef.current || !window.google?.maps) return;
+    if (!mapRef.current || !window.L) return;
     const liveIds = new Set(activeShifts.map(s => s.id));
     Object.keys(markersRef.current).forEach(id => {
-      if (!liveIds.has(id)) { markersRef.current[id].setMap(null); delete markersRef.current[id]; }
+      if (!liveIds.has(id)) { mapRef.current.removeLayer(markersRef.current[id]); delete markersRef.current[id]; }
     });
     const pts = [];
     activeShifts.forEach(s => {
@@ -2089,30 +2085,32 @@ function FleetMapTab({ state }) {
       const { lat, lng, at } = s.currentLocation;
       pts.push([lat, lng]);
       const ageMin = Math.max(0, Math.round((Date.now() - new Date(at).getTime()) / 60000));
-      const title = `${carLabelById(state, s.car)} · ${driver?.name || ''} · ενημέρωση πριν ${ageMin} λεπτά`;
+      const html = `<b>${carLabelById(state, s.car)}</b><br/>${driver?.name || ''}<br/>ενημέρωση πριν ${ageMin} λεπτά`;
       if (markersRef.current[s.id]) {
-        markersRef.current[s.id].setPosition({ lat, lng }); markersRef.current[s.id].setTitle(title);
+        markersRef.current[s.id].setLatLng([lat, lng]).setPopupContent(html);
       } else {
-        markersRef.current[s.id] = new window.google.maps.Marker({ map: mapRef.current, position: { lat, lng }, title, icon: { path: window.google.maps.SymbolPath.FORWARD_CLOSED_ARROW, scale: 6, rotation: s.currentLocation.heading || 0, fillColor: '#3388ff', fillOpacity: 1, strokeColor: '#fff', strokeWeight: 1 } });
+        markersRef.current[s.id] = window.L.marker([lat, lng]).addTo(mapRef.current).bindPopup(html);
       }
     });
-    if (pts.length > 0) { const bounds = new window.google.maps.LatLngBounds(); pts.forEach(p => bounds.extend({ lat: p[0], lng: p[1] })); mapRef.current.fitBounds(bounds, 30); }
+    if (pts.length > 0) mapRef.current.fitBounds(pts, { maxZoom: 15, padding: [30, 30] });
   }, [positionsKey]);
 
   useEffect(() => {
-    if (!mapRef.current || !window.google?.maps) return;
+    if (!mapRef.current || !window.L) return;
     const liveIds = new Set(pendingAppts.map(a => a.id));
     Object.keys(apptMarkersRef.current).forEach(id => {
-      if (!liveIds.has(id)) { apptMarkersRef.current[id].setMap(null); delete apptMarkersRef.current[id]; }
+      if (!liveIds.has(id)) { mapRef.current.removeLayer(apptMarkersRef.current[id]); delete apptMarkersRef.current[id]; }
     });
     pendingAppts.forEach(a => {
       const driver = state.drivers.find(d => d.id === a.driverId);
       const meta = STATUS_META[a.status] || STATUS_META.pending;
-      const title = `${a.customerName} · ${a.time} · ${a.pickup} · ${driver ? driver.name : 'Χωρίς ανάθεση'} · ${meta.label}`;
+      const html = `✈ <b>${a.customerName}</b><br/>${a.time} · ${a.pickup}<br/>${driver ? driver.name : 'Χωρίς ανάθεση'}<br/><span style="color:${meta.color}">${meta.label}</span>`;
       if (apptMarkersRef.current[a.id]) {
-        apptMarkersRef.current[a.id].setTitle(title);
+        apptMarkersRef.current[a.id].setPopupContent(html);
       } else {
-        apptMarkersRef.current[a.id] = new window.google.maps.Marker({ map: mapRef.current, position: { lat: Number(a.pickupLat), lng: Number(a.pickupLng) }, title, icon: { path: window.google.maps.SymbolPath.CIRCLE, scale: 8, fillColor: '#F5B942', fillOpacity: 1, strokeColor: '#fff', strokeWeight: 2 } });
+        apptMarkersRef.current[a.id] = window.L.circleMarker([a.pickupLat, a.pickupLng], {
+          radius: 9, color: '#F5B942', weight: 2, fillColor: '#F5B942', fillOpacity: 0.85,
+        }).addTo(mapRef.current).bindPopup(html);
       }
     });
   }, [apptsKey]);
@@ -2120,8 +2118,7 @@ function FleetMapTab({ state }) {
   return (
     <div>
       <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Χάρτης στόλου (ζωντανά)</div>
-      <div style={{ color: MUTE, fontSize: 12, marginBottom: 4 }}>Google Maps · η θέση ενημερώνεται από Supabase Realtime όταν υπάρχει ενεργή βάρδια.</div>
-      {mapError && <div style={{ color: RED, fontSize: 12, marginBottom: 8 }}>✗ {mapError}</div>}
+      <div style={{ color: MUTE, fontSize: 12, marginBottom: 4 }}>Η θέση ενημερώνεται μόνο όσο ο οδηγός έχει ανοιχτή την εφαρμογή στο κινητό του.</div>
       <div style={{ display: 'flex', gap: 14, marginBottom: 12, flexWrap: 'wrap' }}>
         <Legend color="#3388ff" label="Όχημα σε βάρδια" />
         <Legend color="#F5B942" label="Σημείο παραλαβής ραντεβού" />
@@ -2532,12 +2529,11 @@ function FleetTab({ state, persist }) {
   const [editingAdminAccount, setEditingAdminAccount] = useState(false);
   const [flagFall, setFlagFall] = useState(String(state.fareSettings?.flagFall ?? 1.9));
   const [perKm, setPerKm] = useState(String(state.fareSettings?.perKm ?? 1.65));
-  const [perMinute, setPerMinute] = useState(String(state.fareSettings?.perMinute ?? 0));
   const [minFare, setMinFare] = useState(String(state.fareSettings?.minFare ?? 3.5));
   const [fareSaved, setFareSaved] = useState(false);
 
   const saveFareSettings = async () => {
-    await persist({ ...state, fareSettings: { flagFall: Number(flagFall) || 0, perKm: Number(perKm) || 0, perMinute: Number(perMinute) || 0, minFare: Number(minFare) || 0 } });
+    await persist({ ...state, fareSettings: { flagFall: Number(flagFall) || 0, perKm: Number(perKm) || 0, minFare: Number(minFare) || 0 } });
     setFareSaved(true);
     setTimeout(() => setFareSaved(false), 2000);
   };
@@ -2648,10 +2644,6 @@ function FleetTab({ state, persist }) {
           <div style={{ flex: 1 }}>
             <label style={label}>Τιμή ανά χλμ (€)</label>
             <input type="number" value={perKm} onChange={e => setPerKm(e.target.value)} style={{ ...input, marginBottom: 0 }} />
-          </div>
-          <div style={{ flex: 1 }}>
-            <label style={label}>Τιμή ανά λεπτό (€)</label>
-            <input type="number" value={perMinute} onChange={e => setPerMinute(e.target.value)} style={{ ...input, marginBottom: 0 }} />
           </div>
           <div style={{ flex: 1 }}>
             <label style={label}>Ελάχιστη χρέωση (€)</label>
@@ -2882,6 +2874,8 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
   const [customerName, setCustomerName] = useState(appointment?.customerName || '');
   const [customerPhone, setCustomerPhone] = useState(appointment?.customerPhone || '');
   const [pickup, setPickup] = useState(appointment?.pickup || '');
+  const [pickupPlaceId, setPickupPlaceId] = useState(null);
+  const [dropoffPlaceId, setDropoffPlaceId] = useState(null);
   const [dropoff, setDropoff] = useState(appointment?.dropoff || '');
   const [driverId, setDriverId] = useState(appointment?.driverId || '');
   const [car, setCar] = useState(appointment?.car || '');
@@ -2890,7 +2884,6 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
   const [price, setPrice] = useState(appointment?.price != null ? String(appointment.price) : '');
   const [paymentMethod, setPaymentMethod] = useState(appointment?.paymentMethod || 'cash');
   const [error, setError] = useState('');
-  const [routeSnapshot, setRouteSnapshot] = useState(appointment?.routeSnapshot || null);
 
   const conflict = useMemo(() => {
     if (!driverId && !car) return null;
@@ -2915,11 +2908,6 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
           date, time, durationMin: Number(durationMin),
           customerName, customerPhone, pickup, dropoff, driverId: driverId || null, car: car || null,
           notes, passengers: Number(passengers), price: price === '' ? null : Number(price), paymentMethod,
-          routeSnapshot: routeSnapshot || a.routeSnapshot || null,
-          pickupLat: routeSnapshot?.pickup?.lat ?? a.pickupLat ?? null, pickupLng: routeSnapshot?.pickup?.lng ?? a.pickupLng ?? null,
-          pickupPlaceId: routeSnapshot?.pickup?.placeId ?? a.pickupPlaceId ?? null,
-          dropoffLat: routeSnapshot?.destination?.lat ?? a.dropoffLat ?? null, dropoffLng: routeSnapshot?.destination?.lng ?? a.dropoffLng ?? null,
-          dropoffPlaceId: routeSnapshot?.destination?.placeId ?? a.dropoffPlaceId ?? null,
           status: wasUnassigned && nowAssigned ? 'assigned' : a.status,
           assignedAt: wasUnassigned && nowAssigned ? new Date().toISOString() : a.assignedAt,
         } : a),
@@ -2928,6 +2916,11 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
       await persist(next);
       if (wasUnassigned && nowAssigned && driverId) {
         sendPushToDriver(driverId, 'Νέο ραντεβού', `${time} · ${pickup} → ${dropoff}`, appointment.id);
+      }
+      if (pickup && pickup !== appointment.pickup) {
+        geocodeAddress(pickup).then(coords => {
+          if (coords) persist({ ...state, appointments: state.appointments.map(a => a.id === appointment.id ? { ...a, pickupLat: coords.lat, pickupLng: coords.lng } : a) });
+        });
       }
     } else {
       const appt = {
@@ -2939,13 +2932,15 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
         createdAt: new Date().toISOString(),
         assignedAt: (driverId || car) ? new Date().toISOString() : null,
         acceptedAt: null, arrivedAt: null, completedAt: null,
-        routeSnapshot,
-        pickupLat: routeSnapshot?.pickup?.lat ?? null, pickupLng: routeSnapshot?.pickup?.lng ?? null, pickupPlaceId: routeSnapshot?.pickup?.placeId ?? null,
-        dropoffLat: routeSnapshot?.destination?.lat ?? null, dropoffLng: routeSnapshot?.destination?.lng ?? null, dropoffPlaceId: routeSnapshot?.destination?.placeId ?? null,
       };
       await persist({ ...state, appointments: [...state.appointments, appt] });
       if (driverId) {
         sendPushToDriver(driverId, 'Νέο ραντεβού', `${time} · ${pickup} → ${dropoff}`, appt.id);
+      }
+      if (pickup) {
+        geocodeAddress(pickup).then(coords => {
+          if (coords) persist({ ...state, appointments: [...state.appointments, appt].map(a => a.id === appt.id ? { ...a, pickupLat: coords.lat, pickupLng: coords.lng } : a) });
+        });
       }
     }
     onClose();
@@ -2985,23 +2980,29 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
           {[1, 2, 3, 4, 5, 6, 7, 8].map(n => <option key={n} value={n}>{n}</option>)}
         </select>
 
-        <div style={{ display: 'flex', gap: 10 }}>
-          <div style={{ flex: 1 }}>
-            <label style={label}>Παραλαβή</label>
-            <input value={pickup} onChange={e => setPickup(e.target.value)} style={input} placeholder="π.χ. Αεροδρόμιο" />
-          </div>
-          <div style={{ flex: 1 }}>
-            <label style={label}>Προορισμός</label>
-            <input value={dropoff} onChange={e => setDropoff(e.target.value)} style={input} placeholder="π.χ. Κέντρο" />
-          </div>
-        </div>
+        <AddressAutocomplete
+          label="Παραλαβή"
+          value={pickup}
+          onChange={setPickup}
+          onPick={setPickupPlaceId}
+          placeholder="π.χ. Αεροδρόμιο Μακεδονία"
+        />
+
+        <AddressAutocomplete
+          label="Προορισμός"
+          value={dropoff}
+          onChange={setDropoff}
+          onPick={setDropoffPlaceId}
+          placeholder="π.χ. Τσιμισκή 43, Θεσσαλονίκη"
+        />
 
         <FareCalculator
           fareSettings={state.fareSettings || { flagFall: 1.9, perKm: 1.65, minFare: 3.5 }}
           pickupText={pickup}
+          pickupPlaceId={pickupPlaceId}
           dropoffText={dropoff}
+          dropoffPlaceId={dropoffPlaceId}
           onPriceComputed={p => setPrice(String(p))}
-          onRouteComputed={setRouteSnapshot}
         />
 
         <div style={{ display: 'flex', gap: 10 }}>
