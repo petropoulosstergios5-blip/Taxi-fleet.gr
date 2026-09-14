@@ -184,6 +184,22 @@ function carLabelById(state, carId) {
   return carLabel(state.cars.find(c => c.id === carId));
 }
 
+// Πινακίδες: το GPSON τις δίνει λατινικά με κενά/παύλες ("TAE - 3707"), ο admin τις
+// γράφει ελληνικά χωρίς κενά ("ΤΑΕ4990"). Τα Τ/Α/Ε είναι ΔΙΑΦΟΡΕΤΙΚΟΙ χαρακτήρες παρότι
+// φαίνονται ίδιοι, οπότε χωρίς αυτή τη μετατροπή καμία αντιστοίχιση δεν βρίσκεται ποτέ.
+const GR2LAT_PLATE = {
+  'Α': 'A', 'Β': 'B', 'Ε': 'E', 'Ζ': 'Z', 'Η': 'H', 'Ι': 'I', 'Κ': 'K',
+  'Μ': 'M', 'Ν': 'N', 'Ο': 'O', 'Ρ': 'P', 'Τ': 'T', 'Υ': 'Y', 'Χ': 'X',
+};
+function normPlate(s) {
+  return String(s == null ? '' : s)
+    .toUpperCase()
+    .replace(/[^\p{L}\p{N}]/gu, '')
+    .split('')
+    .map(function (c) { return GR2LAT_PLATE[c] || c; })
+    .join('');
+}
+
 // A driver's cash float ("ταμείο") carries over automatically from their last closed
 // shift's ending float — not the general turnover, just the physical cash they're
 // holding. New drivers (or ones with no prior closed shift) start at €0. Manual
@@ -264,6 +280,12 @@ async function applyAppointmentPatch(state, persist, appointment, patch, actor) 
 // Function. The API key deliberately lives server-side: embedding it in the app bundle
 // would let anyone read it from the page source and spend against the billing account.
 const MAPS_PROXY_URL = `${SUPABASE_URL}/functions/v1/maps-proxy`;
+const GPS_PROXY_URL = `${SUPABASE_URL}/functions/v1/gps-proxy`;
+// 20s x 1 ανοιχτός χάρτης ≈ 130k κλήσεις/μήνα — μέσα στο δωρεάν όριο του Supabase.
+// Αν δοθεί ο χάρτης και στους οδηγούς, αυτό ΔΕΝ αντέχει: χρειάζεται cron + πίνακας θέσεων.
+const GPS_POLL_MS = 20000;
+const GPS_FALLBACK_BLUE = '#3388ff';
+const GPS_OTHER_GREY = '#8a8f98';
 const placeCache = new Map();
 
 async function mapsProxy(payload) {
@@ -2087,15 +2109,87 @@ function useGoogleMapsReady() {
   return ready;
 }
 
+// Τραβάει θέσεις από το GPSON μέσω του gps-proxy. Μόνο όσο η καρτέλα χάρτη είναι
+// ανοιχτή ΚΑΙ ορατή — με κρυφή καρτέλα δεν καλεί, για να μην καίγονται invocations.
+function useGpsPositions(enabled) {
+  const [gps, setGps] = useState({ vehicles: [], error: null, loading: true, fetchedAt: null });
+
+  useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    let timer = null;
+
+    const schedule = () => { timer = setTimeout(tick, GPS_POLL_MS); };
+
+    async function tick() {
+      if (document.hidden) { schedule(); return; }
+      try {
+        const res = await fetch(GPS_PROXY_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', apikey: SUPABASE_ANON_KEY },
+          body: JSON.stringify({ mode: 'normalized' }),
+        });
+        const json = await res.json();
+        if (cancelled) return;
+        if (json && json.error) {
+          setGps(g => ({ ...g, error: 'Το GPS δεν απάντησε σωστά.', loading: false }));
+        } else {
+          setGps({ vehicles: json.vehicles || [], error: null, loading: false, fetchedAt: json.fetchedAt || null });
+        }
+      } catch (e) {
+        if (!cancelled) setGps(g => ({ ...g, error: 'Αδυναμία σύνδεσης με το GPS.', loading: false }));
+      }
+      if (!cancelled) schedule();
+    }
+
+    const onVisible = () => {
+      if (!document.hidden) { clearTimeout(timer); tick(); }
+    };
+
+    tick();
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [enabled]);
+
+  return gps;
+}
+
 function FleetMapTab({ state }) {
   const mapDivRef = useRef(null);
   const mapRef = useRef(null);
   const infoRef = useRef(null);
   const markersRef = useRef({});
   const apptMarkersRef = useRef({});
+  const gpsMarkersRef = useRef({});
   const mapsReady = useGoogleMapsReady();
 
-  const activeShifts = state.shifts.filter(s => s.status === 'active' && s.currentLocation);
+  // Ο χάρτης είναι admin-only, οπότε το polling ξεκινά με το που ανοίξει η καρτέλα.
+  const gps = useGpsPositions(true);
+
+  // Πινακίδα (κανονικοποιημένη) -> όχημα του στόλου σου.
+  const ownByPlate = useMemo(() => {
+    const m = new Map();
+    (state.cars || []).forEach(c => {
+      const p = normPlate(c.plate);
+      if (p) m.set(p, c);
+    });
+    return m;
+  }, [state.cars]);
+
+  // Οχήματα με έγκυρο & πρόσφατο στίγμα GPS.
+  const gpsLive = gps.vehicles.filter(v => v.hasFix && !v.stale);
+
+  // Αν ένα δικό σου όχημα έχει φρέσκο GPS, αυτό υπερισχύει του στίγματος από το κινητό
+  // του οδηγού (πιο αξιόπιστο) — δείχνουμε ένα marker, όχι δύο.
+  const carIdsWithGps = new Set(
+    gpsLive.map(v => { const c = ownByPlate.get(v.plate); return c ? c.id : null; }).filter(Boolean)
+  );
+
+  const activeShifts = state.shifts.filter(s => s.status === 'active' && s.currentLocation && !carIdsWithGps.has(s.car));
   const positionsKey = activeShifts.map(s => `${s.id}:${s.currentLocation.lat.toFixed(5)}:${s.currentLocation.lng.toFixed(5)}`).join('|');
 
   const todayIso = isoDateStr(new Date());
@@ -2195,13 +2289,81 @@ function FleetMapTab({ state }) {
     });
   }, [apptsKey, mapsReady]);
 
+  // GPS markers (GPSON)
+  const gpsKey = gps.vehicles
+    .map(v => `${v.unitId}:${v.lat}:${v.lng}:${v.stale ? 1 : 0}`)
+    .join('|');
+
+  useEffect(() => {
+    if (!mapRef.current) return;
+    const g = window.google.maps;
+    const liveIds = new Set(gps.vehicles.filter(v => v.hasFix).map(v => 'gps:' + v.unitId));
+    Object.keys(gpsMarkersRef.current).forEach(id => {
+      if (!liveIds.has(id)) { gpsMarkersRef.current[id].setMap(null); delete gpsMarkersRef.current[id]; }
+    });
+
+    gps.vehicles.forEach(v => {
+      if (!v.hasFix) return;
+      const key = 'gps:' + v.unitId;
+      const car = ownByPlate.get(v.plate);
+      const isOwn = !!car;
+      const pos = { lat: v.lat, lng: v.lng };
+      const age = v.ageMinutes == null ? '—' : `πριν ${v.ageMinutes} λεπτά`;
+      const seen = v.lastUpdate ? new Date(v.lastUpdate).toLocaleString('el-GR') : '—';
+      const title = isOwn ? carLabel(car) : (v.plateRaw || String(v.unitId));
+      const html = `<div style="color:#111;font-size:13px"><b>${title}</b>` +
+        (isOwn ? '' : `<br/><span style="color:#666">Εκτός ανάθεσης</span>`) +
+        (v.make ? `<br/>${v.make}` : '') +
+        `<br/>${v.movement === 'driving' ? `Σε κίνηση · ${v.speed} km/h` : 'Σταματημένο'}` +
+        `<br/>ενημέρωση ${age}<br/><span style="color:#666">${seen}</span></div>`;
+
+      const icon = {
+        path: g.SymbolPath.CIRCLE,
+        scale: isOwn ? 9 : 6,
+        fillColor: isOwn ? GPS_FALLBACK_BLUE : GPS_OTHER_GREY,
+        fillOpacity: v.stale ? 0.3 : 1,
+        strokeColor: '#ffffff',
+        strokeWeight: v.stale ? 1 : 2,
+      };
+
+      const existing = gpsMarkersRef.current[key];
+      if (existing) {
+        existing.setPosition(pos);
+        existing.setIcon(icon);
+        existing.setZIndex(isOwn ? 3 : 1);
+        existing.infoHtml = html;
+      } else {
+        const marker = new g.Marker({ position: pos, map: mapRef.current, title, icon, zIndex: isOwn ? 3 : 1 });
+        marker.infoHtml = html;
+        marker.addListener('click', () => {
+          infoRef.current.setContent(marker.infoHtml);
+          infoRef.current.open({ anchor: marker, map: mapRef.current });
+        });
+        gpsMarkersRef.current[key] = marker;
+      }
+    });
+  }, [gpsKey, mapsReady, ownByPlate]);
+
+  const ownGpsCount = gpsLive.filter(v => ownByPlate.has(v.plate)).length;
+  const staleCount = gps.vehicles.filter(v => v.stale).length;
+
   return (
     <div>
       <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Χάρτης στόλου (ζωντανά)</div>
-      <div style={{ color: MUTE, fontSize: 12, marginBottom: 4 }}>Η θέση ενημερώνεται μόνο όσο ο οδηγός έχει ανοιχτή την εφαρμογή στο κινητό του.</div>
+      <div style={{ color: MUTE, fontSize: 12, marginBottom: 4 }}>Τα οχήματα με συσκευή GPS ενημερώνονται αυτόματα. Για τα υπόλοιπα, η θέση έρχεται από το κινητό του οδηγού μόνο όσο έχει ανοιχτή την εφαρμογή.</div>
       <div style={{ display: 'flex', gap: 14, marginBottom: 12, flexWrap: 'wrap' }}>
-        <Legend color="#3388ff" label="Όχημα σε βάρδια" />
+        <Legend color={GPS_FALLBACK_BLUE} label="Δικό σου όχημα" />
+        <Legend color={GPS_OTHER_GREY} label="Όχημα συνεργάτη (ενημερωτικά)" />
         <Legend color="#F5B942" label="Σημείο παραλαβής ραντεβού" />
+      </div>
+      <div style={{ color: MUTE, fontSize: 12, marginBottom: 12 }}>
+        {gps.loading && 'Φόρτωση θέσεων GPS…'}
+        {gps.error && <span style={{ color: RED }}>{gps.error}</span>}
+        {!gps.loading && !gps.error && (
+          <>GPS: {gpsLive.length} από {gps.vehicles.length} οχήματα με πρόσφατο στίγμα
+          {ownGpsCount > 0 && ` · ${ownGpsCount} δικά σου`}
+          {staleCount > 0 && ` · ${staleCount} χωρίς σήμα (ημιδιάφανα)`}</>
+        )}
       </div>
       {activeShifts.length === 0 && pendingAppts.length === 0 && (
         <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 12, padding: 16, color: MUTE, fontSize: 13, marginBottom: 12 }}>
