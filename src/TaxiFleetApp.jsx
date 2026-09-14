@@ -2347,6 +2347,15 @@ function FleetMapTab({ state }) {
   const ownGpsCount = gpsLive.filter(v => ownByPlate.has(v.plate)).length;
   const staleCount = gps.vehicles.filter(v => v.stale).length;
 
+  // Διάγνωση αντιστοίχισης: ποια οχήματα του app ΔΕΝ βρέθηκαν στο GPSON και γιατί.
+  const gpsPlateSet = new Set(gps.vehicles.map(v => v.plate).filter(Boolean));
+  const unmatchedCars = (state.cars || []).map(c => {
+    const np = normPlate(c.plate);
+    if (!np) return { car: c, reason: 'Δεν έχει συμπληρωθεί αριθμός κυκλοφορίας' };
+    if (!gpsPlateSet.has(np)) return { car: c, reason: `Η πινακίδα "${c.plate}" δεν υπάρχει στο GPSON` };
+    return null;
+  }).filter(Boolean);
+
   return (
     <div>
       <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Χάρτης στόλου (ζωντανά)</div>
@@ -2376,6 +2385,24 @@ function FleetMapTab({ state }) {
         </div>
       )}
       <div ref={mapDivRef} style={{ width: '100%', height: 440, borderRadius: 12, overflow: 'hidden', border: `1px solid ${BORDER}` }} />
+
+      {!gps.loading && !gps.error && unmatchedCars.length > 0 && (
+        <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 12, padding: 14, marginTop: 12 }}>
+          <div style={{ color: TEXT, fontSize: 13, fontWeight: 700, marginBottom: 6 }}>Οχήματα χωρίς σύνδεση με GPS</div>
+          <div style={{ color: MUTE, fontSize: 12, marginBottom: 10 }}>
+            Η σύνδεση γίνεται αποκλειστικά με τον αριθμό κυκλοφορίας. Διόρθωσέ τον στο «Στόλος &amp; Οδηγοί» ώστε να ταιριάζει με τη λίστα από κάτω.
+          </div>
+          {unmatchedCars.map(({ car, reason }) => (
+            <div key={car.id} style={{ color: TEXT, fontSize: 12, marginBottom: 4 }}>
+              <b>{carLabel(car)}</b> <span style={{ color: MUTE }}>— {reason}</span>
+            </div>
+          ))}
+          <div style={{ color: MUTE, fontSize: 12, marginTop: 10, marginBottom: 4 }}>Πινακίδες που βλέπει το GPSON:</div>
+          <div style={{ color: TEXT, fontSize: 12, lineHeight: 1.7, wordBreak: 'break-word' }}>
+            {gps.vehicles.map(v => v.plateRaw || `#${v.unitId}`).join(' · ')}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
