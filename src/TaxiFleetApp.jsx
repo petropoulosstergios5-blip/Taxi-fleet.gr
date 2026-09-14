@@ -285,7 +285,7 @@ const GPS_PROXY_URL = `${SUPABASE_URL}/functions/v1/gps-proxy`;
 // Αν δοθεί ο χάρτης και στους οδηγούς, αυτό ΔΕΝ αντέχει: χρειάζεται cron + πίνακας θέσεων.
 const GPS_POLL_MS = 20000;
 const GPS_FALLBACK_BLUE = '#3388ff';
-const GPS_OTHER_GREY = '#8a8f98';
+const GPS_OTHER_PURPLE = '#A855F7';
 const placeCache = new Map();
 
 async function mapsProxy(payload) {
@@ -2320,7 +2320,7 @@ function FleetMapTab({ state }) {
       const icon = {
         path: g.SymbolPath.CIRCLE,
         scale: isOwn ? 9 : 6,
-        fillColor: isOwn ? GPS_FALLBACK_BLUE : GPS_OTHER_GREY,
+        fillColor: isOwn ? GPS_FALLBACK_BLUE : GPS_OTHER_PURPLE,
         fillOpacity: v.stale ? 0.3 : 1,
         strokeColor: '#ffffff',
         strokeWeight: v.stale ? 1 : 2,
@@ -2353,7 +2353,7 @@ function FleetMapTab({ state }) {
       <div style={{ color: MUTE, fontSize: 12, marginBottom: 4 }}>Τα οχήματα με συσκευή GPS ενημερώνονται αυτόματα. Για τα υπόλοιπα, η θέση έρχεται από το κινητό του οδηγού μόνο όσο έχει ανοιχτή την εφαρμογή.</div>
       <div style={{ display: 'flex', gap: 14, marginBottom: 12, flexWrap: 'wrap' }}>
         <Legend color={GPS_FALLBACK_BLUE} label="Δικό σου όχημα" />
-        <Legend color={GPS_OTHER_GREY} label="Όχημα συνεργάτη (ενημερωτικά)" />
+        <Legend color={GPS_OTHER_PURPLE} label="Όχημα συνεργάτη (ενημερωτικά)" />
         <Legend color="#F5B942" label="Σημείο παραλαβής ραντεβού" />
       </div>
       <div style={{ color: MUTE, fontSize: 12, marginBottom: 12 }}>
