@@ -284,7 +284,7 @@ const GPS_PROXY_URL = `${SUPABASE_URL}/functions/v1/gps-proxy`;
 // 20s x 1 ανοιχτός χάρτης ≈ 130k κλήσεις/μήνα — μέσα στο δωρεάν όριο του Supabase.
 // Αν δοθεί ο χάρτης και στους οδηγούς, αυτό ΔΕΝ αντέχει: χρειάζεται cron + πίνακας θέσεων.
 const GPS_POLL_MS = 20000;
-const GPS_FALLBACK_BLUE = '#3388ff';
+const GPS_OWN_LIME = '#39FF14';
 const GPS_OTHER_PURPLE = '#A855F7';
 const placeCache = new Map();
 
@@ -2236,7 +2236,7 @@ function FleetMapTab({ state }) {
           position: pos, map: mapRef.current, title: carLabelById(state, s.car),
           icon: {
             path: g.SymbolPath.CIRCLE, scale: 9,
-            fillColor: '#3388ff', fillOpacity: 1, strokeColor: '#ffffff', strokeWeight: 2,
+            fillColor: GPS_OWN_LIME, fillOpacity: 1, strokeColor: '#ffffff', strokeWeight: 2,
           },
         });
         marker.infoHtml = html;
@@ -2320,7 +2320,7 @@ function FleetMapTab({ state }) {
       const icon = {
         path: g.SymbolPath.CIRCLE,
         scale: isOwn ? 9 : 6,
-        fillColor: isOwn ? GPS_FALLBACK_BLUE : GPS_OTHER_PURPLE,
+        fillColor: isOwn ? GPS_OWN_LIME : GPS_OTHER_PURPLE,
         fillOpacity: v.stale ? 0.3 : 1,
         strokeColor: '#ffffff',
         strokeWeight: v.stale ? 1 : 2,
@@ -2352,7 +2352,7 @@ function FleetMapTab({ state }) {
       <div style={{ color: TEXT, fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Χάρτης στόλου (ζωντανά)</div>
       <div style={{ color: MUTE, fontSize: 12, marginBottom: 4 }}>Τα οχήματα με συσκευή GPS ενημερώνονται αυτόματα. Για τα υπόλοιπα, η θέση έρχεται από το κινητό του οδηγού μόνο όσο έχει ανοιχτή την εφαρμογή.</div>
       <div style={{ display: 'flex', gap: 14, marginBottom: 12, flexWrap: 'wrap' }}>
-        <Legend color={GPS_FALLBACK_BLUE} label="Δικό σου όχημα" />
+        <Legend color={GPS_OWN_LIME} label="Δικό σου όχημα" />
         <Legend color={GPS_OTHER_PURPLE} label="Όχημα συνεργάτη (ενημερωτικά)" />
         <Legend color="#F5B942" label="Σημείο παραλαβής ραντεβού" />
       </div>
