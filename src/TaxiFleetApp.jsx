@@ -2983,6 +2983,19 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
     const finalCheck = checkAppointmentConflict(state, { date, time, durationMin: Number(durationMin), driverId, car, excludeId: appointment?.id });
     if (!finalCheck.ok) { setError(finalCheck.reason); return; }
 
+    // Resolve pickup coordinates BEFORE saving, so everything lands in one write.
+    // Previously this ran after the save and persisted a stale copy of the state, which
+    // silently wiped whatever had just been set (most visibly the driver assignment).
+    let pickupCoords = null;
+    if (pickup && (!isEdit || pickup !== appointment.pickup)) {
+      try {
+        pickupCoords = pickupPlaceId ? await resolvePlace(pickupPlaceId) : await geocodeAddress(pickup);
+      } catch (e) {
+        pickupCoords = null; // map pin is optional — never block saving the appointment
+      }
+    }
+    const coordFields = pickupCoords ? { pickupLat: pickupCoords.lat, pickupLng: pickupCoords.lng } : {};
+
     if (isEdit) {
       const wasUnassigned = !appointment.driverId && !appointment.car;
       const nowAssigned = !!(driverId || car);
@@ -2993,6 +3006,7 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
           date, time, durationMin: Number(durationMin),
           customerName, customerPhone, pickup, dropoff, driverId: driverId || null, car: car || null,
           notes, passengers: Number(passengers), price: price === '' ? null : Number(price), paymentMethod,
+          ...coordFields,
           status: wasUnassigned && nowAssigned ? 'assigned' : a.status,
           assignedAt: wasUnassigned && nowAssigned ? new Date().toISOString() : a.assignedAt,
         } : a),
@@ -3002,11 +3016,6 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
       if (wasUnassigned && nowAssigned && driverId) {
         sendPushToDriver(driverId, 'Νέο ραντεβού', `${time} · ${pickup} → ${dropoff}`, appointment.id);
       }
-      if (pickup && pickup !== appointment.pickup) {
-        geocodeAddress(pickup).then(coords => {
-          if (coords) persist({ ...state, appointments: state.appointments.map(a => a.id === appointment.id ? { ...a, pickupLat: coords.lat, pickupLng: coords.lng } : a) });
-        });
-      }
     } else {
       const appt = {
         id: 'appt_' + Date.now(),
@@ -3014,6 +3023,7 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
         customerName, customerPhone, pickup, dropoff, driverId: driverId || null, car: car || null,
         status: driverId || car ? 'assigned' : 'pending',
         notes, passengers: Number(passengers), price: price === '' ? null : Number(price), paymentMethod,
+        ...coordFields,
         createdAt: new Date().toISOString(),
         assignedAt: (driverId || car) ? new Date().toISOString() : null,
         acceptedAt: null, arrivedAt: null, completedAt: null,
@@ -3021,11 +3031,6 @@ function NewAppointmentModal({ state, persist, onClose, defaultDate, defaultTime
       await persist({ ...state, appointments: [...state.appointments, appt] });
       if (driverId) {
         sendPushToDriver(driverId, 'Νέο ραντεβού', `${time} · ${pickup} → ${dropoff}`, appt.id);
-      }
-      if (pickup) {
-        geocodeAddress(pickup).then(coords => {
-          if (coords) persist({ ...state, appointments: [...state.appointments, appt].map(a => a.id === appt.id ? { ...a, pickupLat: coords.lat, pickupLng: coords.lng } : a) });
-        });
       }
     }
     onClose();
