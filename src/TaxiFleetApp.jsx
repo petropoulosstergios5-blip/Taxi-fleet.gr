@@ -197,7 +197,7 @@ const GR2LAT_PLATE = {
 function markerLabel(google, text, scale, faded) {
   return {
     text: String(text || ''),
-    color: faded ? 'rgba(255,255,255,0.45)' : '#ffffff',
+    color: faded ? 'rgba(240,255,0,0.45)' : '#F0FF00',
     fontSize: '11px',
     fontWeight: '700',
   };
