@@ -191,6 +191,21 @@ const GR2LAT_PLATE = {
   'Α': 'A', 'Β': 'B', 'Ε': 'E', 'Ζ': 'Z', 'Η': 'H', 'Ι': 'I', 'Κ': 'K',
   'Μ': 'M', 'Ν': 'N', 'Ο': 'O', 'Ρ': 'P', 'Τ': 'T', 'Υ': 'Y', 'Χ': 'X',
 };
+// Ετικέτα πινακίδας πάνω από την κουκίδα. Το labelOrigin είναι σε συντεταγμένες του
+// symbol, που πολλαπλασιάζονται με το scale — γι' αυτό διαιρούμε, ώστε η απόσταση
+// σε pixel να μένει σταθερή ανεξαρτήτως μεγέθους κουκίδας.
+function markerLabel(google, text, scale, faded) {
+  return {
+    text: String(text || ''),
+    color: faded ? 'rgba(255,255,255,0.45)' : '#ffffff',
+    fontSize: '11px',
+    fontWeight: '700',
+  };
+}
+function labelOriginFor(google, scale) {
+  return new google.Point(0, -(22 / scale));
+}
+
 function normPlate(s) {
   return String(s == null ? '' : s)
     .toUpperCase()
@@ -2183,13 +2198,28 @@ function FleetMapTab({ state }) {
   // Οχήματα με έγκυρο & πρόσφατο στίγμα GPS.
   const gpsLive = gps.vehicles.filter(v => v.hasFix && !v.stale);
 
-  // Αν ένα δικό σου όχημα έχει φρέσκο GPS, αυτό υπερισχύει του στίγματος από το κινητό
-  // του οδηγού (πιο αξιόπιστο) — δείχνουμε ένα marker, όχι δύο.
-  const carIdsWithGps = new Set(
-    gpsLive.map(v => { const c = ownByPlate.get(v.plate); return c ? c.id : null; }).filter(Boolean)
-  );
+  // Ποιο στίγμα GPS αντιστοιχεί σε ποιο δικό σου όχημα.
+  const gpsFixByCarId = new Map();
+  gps.vehicles.forEach(v => {
+    if (!v.hasFix) return;
+    const c = ownByPlate.get(v.plate);
+    if (c) gpsFixByCarId.set(c.id, v);
+  });
 
-  const activeShifts = state.shifts.filter(s => s.status === 'active' && s.currentLocation && !carIdsWithGps.has(s.car));
+  // Ένα όχημα, ένα marker: κερδίζει η ΠΙΟ ΠΡΟΣΦΑΤΗ πηγή, όχι απλώς το GPS. Αλλιώς ένα
+  // παλιό στίγμα κινητού (π.χ. 7 ωρών) συνυπάρχει στον χάρτη με το πραγματικό του GPS.
+  const gpsKey = gps.vehicles
+    .map(v => `${v.unitId}:${v.lat}:${v.lng}:${v.stale ? 1 : 0}`)
+    .join('|');
+
+  const activeShifts = state.shifts.filter(s => {
+    if (s.status !== 'active' || !s.currentLocation) return false;
+    const v = gpsFixByCarId.get(s.car);
+    if (!v) return true;
+    const gpsT = v.lastUpdate ? Date.parse(v.lastUpdate) : 0;
+    const phoneT = s.currentLocation.at ? Date.parse(s.currentLocation.at) : 0;
+    return phoneT > gpsT;
+  });
   const positionsKey = activeShifts.map(s => `${s.id}:${s.currentLocation.lat.toFixed(5)}:${s.currentLocation.lng.toFixed(5)}`).join('|');
 
   const todayIso = isoDateStr(new Date());
@@ -2227,17 +2257,25 @@ function FleetMapTab({ state }) {
       const pos = { lat, lng };
       bounds.extend(pos); any = true;
       const ageMin = Math.max(0, Math.round((Date.now() - new Date(at).getTime()) / 60000));
-      const html = `<div style="color:#111;font-size:13px"><b>${carLabelById(state, s.car)}</b><br/>${driver?.name || ''}<br/>ενημέρωση πριν ${ageMin} λεπτά</div>`;
+      // Παλιό στίγμα κινητού δεν πρέπει να δείχνει σαν τρέχουσα θέση.
+      const phoneStale = ageMin > 10;
+      const icon = {
+        path: g.SymbolPath.CIRCLE, scale: 9,
+        fillColor: GPS_OWN_LIME, fillOpacity: phoneStale ? 0.3 : 1,
+        strokeColor: '#ffffff', strokeWeight: phoneStale ? 1 : 2,
+        labelOrigin: labelOriginFor(g, 9),
+      };
+      const lbl = markerLabel(g, carLabelById(state, s.car), 9, phoneStale);
+      const html = `<div style="color:#111;font-size:13px"><b>${carLabelById(state, s.car)}</b><br/>${driver?.name || ''}<br/>από κινητό · ενημέρωση πριν ${ageMin} λεπτά` +
+        (phoneStale ? '<br/><span style="color:#B23">Παλιό στίγμα — μπορεί να μην ισχύει</span>' : '') + `</div>`;
       if (markersRef.current[s.id]) {
         markersRef.current[s.id].setPosition(pos);
+        markersRef.current[s.id].setIcon(icon);
+        markersRef.current[s.id].setLabel(lbl);
         markersRef.current[s.id].infoHtml = html;
       } else {
         const marker = new g.Marker({
-          position: pos, map: mapRef.current, title: carLabelById(state, s.car),
-          icon: {
-            path: g.SymbolPath.CIRCLE, scale: 9,
-            fillColor: GPS_OWN_LIME, fillOpacity: 1, strokeColor: '#ffffff', strokeWeight: 2,
-          },
+          position: pos, map: mapRef.current, title: carLabelById(state, s.car), icon, label: lbl,
         });
         marker.infoHtml = html;
         marker.addListener('click', () => {
@@ -2255,7 +2293,7 @@ function FleetMapTab({ state }) {
       });
       return () => window.google.maps.event.removeListener(once);
     }
-  }, [positionsKey, mapsReady]);
+  }, [positionsKey, mapsReady, gpsKey]);
 
   // Appointment pickup markers
   useEffect(() => {
@@ -2290,13 +2328,10 @@ function FleetMapTab({ state }) {
   }, [apptsKey, mapsReady]);
 
   // GPS markers (GPSON)
-  const gpsKey = gps.vehicles
-    .map(v => `${v.unitId}:${v.lat}:${v.lng}:${v.stale ? 1 : 0}`)
-    .join('|');
-
   useEffect(() => {
     if (!mapRef.current) return;
     const g = window.google.maps;
+    const shownFromPhone = new Set(activeShifts.map(s => s.car));
     const liveIds = new Set(gps.vehicles.filter(v => v.hasFix).map(v => 'gps:' + v.unitId));
     Object.keys(gpsMarkersRef.current).forEach(id => {
       if (!liveIds.has(id)) { gpsMarkersRef.current[id].setMap(null); delete gpsMarkersRef.current[id]; }
@@ -2306,6 +2341,11 @@ function FleetMapTab({ state }) {
       if (!v.hasFix) return;
       const key = 'gps:' + v.unitId;
       const car = ownByPlate.get(v.plate);
+      // Αν για αυτό το όχημα δείχνουμε ήδη πιο πρόσφατο στίγμα από το κινητό, παράλειψέ το.
+      if (car && shownFromPhone.has(car.id)) {
+        if (gpsMarkersRef.current[key]) { gpsMarkersRef.current[key].setMap(null); delete gpsMarkersRef.current[key]; }
+        return;
+      }
       const isOwn = !!car;
       const pos = { lat: v.lat, lng: v.lng };
       const age = v.ageMinutes == null ? '—' : `πριν ${v.ageMinutes} λεπτά`;
@@ -2317,23 +2357,27 @@ function FleetMapTab({ state }) {
         `<br/>${v.movement === 'driving' ? `Σε κίνηση · ${v.speed} km/h` : 'Σταματημένο'}` +
         `<br/>ενημέρωση ${age}<br/><span style="color:#666">${seen}</span></div>`;
 
+      const scale = isOwn ? 9 : 6;
       const icon = {
         path: g.SymbolPath.CIRCLE,
-        scale: isOwn ? 9 : 6,
+        scale,
         fillColor: isOwn ? GPS_OWN_LIME : GPS_OTHER_PURPLE,
         fillOpacity: v.stale ? 0.3 : 1,
         strokeColor: '#ffffff',
         strokeWeight: v.stale ? 1 : 2,
+        labelOrigin: labelOriginFor(g, scale),
       };
+      const lbl = markerLabel(g, isOwn ? carLabel(car) : (v.plateRaw || v.plate || ''), scale, v.stale);
 
       const existing = gpsMarkersRef.current[key];
       if (existing) {
         existing.setPosition(pos);
         existing.setIcon(icon);
+        existing.setLabel(lbl);
         existing.setZIndex(isOwn ? 3 : 1);
         existing.infoHtml = html;
       } else {
-        const marker = new g.Marker({ position: pos, map: mapRef.current, title, icon, zIndex: isOwn ? 3 : 1 });
+        const marker = new g.Marker({ position: pos, map: mapRef.current, title, icon, label: lbl, zIndex: isOwn ? 3 : 1 });
         marker.infoHtml = html;
         marker.addListener('click', () => {
           infoRef.current.setContent(marker.infoHtml);
