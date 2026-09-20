@@ -1,15 +1,15 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { createClient } from '@supabase/supabase-js';
+import {
+  supabase, SUPABASE_URL, SUPABASE_ANON_KEY,
+  loadState, saveDiff, subscribeToChanges,
+  signIn, signOut, getSessionProfile,
+} from './cloud';
 import { Car, Clock, MapPin, Fuel, AlertCircle, CheckCircle2, Plus, X, ChevronRight, Navigation, Calendar, User, LogOut, Gauge, Wallet, ArrowLeft, Lock, Camera, CreditCard, Banknote, Smartphone, Plane, Users, Unlock, Filter, XCircle, PlayCircle, Flag, Eye, EyeOff, MessageCircle } from 'lucide-react';
 
-// --- Supabase (cloud sync) ---
-// Publishable/anon keys are meant to be embedded in client code — that's how Supabase works.
-// Real security (who can log in as what) still happens only in this app's own login screen,
-// not via Supabase Auth. Anyone with this key can read/write the single shared row below.
-const SUPABASE_URL = 'https://whecwstuqlyohbvuvfkp.supabase.co';
-const SUPABASE_ANON_KEY = 'sb_publishable_ZhFFRNTKncvML6BBK_j2pA_opwKSVGA';
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-const ROW_ID = 'main'; // single shared state row
+// --- Supabase ---
+// Ο πελάτης, η διεύθυνση και το anon key έρχονται από το cloud.js, ώστε να
+// υπάρχει ΕΝΑΣ πελάτης σε όλη την εφαρμογή (κοινή συνεδρία Auth).
+// Η ασφάλεια δεν στηρίζεται πια στην οθόνη σύνδεσης αλλά στο RLS της βάσης.
 const VAPID_PUBLIC_KEY = 'BKn1btEuoRmHeZAA2jfdHvNphTRjT2wuGKCudYv0KIOTMs_Jtq3T00wc7XjUSJBngMEVxPoTvfdVZYUjhk7Yc1I';
 function urlBase64ToUint8Array(base64String) {
   const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
@@ -484,94 +484,79 @@ const SESSION_KEY = 'taxifleet:session:v1';
 export default function TaxiFleetApp() {
   const [state, setState] = useState(initialState);
   const [loaded, setLoaded] = useState(false);
-  const [session, setSessionRaw] = useState(() => {
-    try {
-      const raw = localStorage.getItem(SESSION_KEY);
-      return raw ? JSON.parse(raw) : null;
-    } catch (e) { return null; }
-  }); // {role:'driver', driverId} | {role:'admin'}
-  const setSession = (next) => {
-    setSessionRaw(next);
-    try {
-      if (next) localStorage.setItem(SESSION_KEY, JSON.stringify(next));
-      else localStorage.removeItem(SESSION_KEY);
-    } catch (e) { /* ignore storage errors */ }
-  };
+  // Η συνεδρία την κρατά πλέον το Supabase Auth (με ανανέωση token).
+  // Δεν αποθηκεύουμε εμείς τίποτα στο localStorage.
+  const [session, setSessionRaw] = useState(null); // {role:'admin'} | {role:'driver', driverId}
   const [cloudStatus, setCloudStatus] = useState('connecting'); // connecting | online | offline
-  const lastWriteRef = useRef(0); // timestamp of our own last write, to avoid a poll overwriting it
+  const stateRef = useRef(state);       // ό,τι πιστεύουμε ότι έχει η βάση αυτή τη στιγμή
+  const savingRef = useRef(false);      // όσο γράφουμε, αγνοούμε τα δικά μας realtime events
 
-  // Initial load: try Supabase first, fall back to localStorage if unreachable.
+  const refresh = useCallback(async () => {
+    try {
+      const fresh = await loadState();
+      stateRef.current = fresh;
+      setState(fresh);
+      setCloudStatus('online');
+      return fresh;
+    } catch (e) {
+      console.error('Load failed:', e);
+      setCloudStatus('offline');
+      return null;
+    }
+  }, []);
+
+  // Συνεδρία: έρχεται από το Supabase Auth, όχι από localStorage.
   useEffect(() => {
     let mounted = true;
     (async () => {
-      try {
-        const { data, error } = await supabase.from('app_state').select('data').eq('id', ROW_ID).single();
-        if (error) throw error;
-        if (mounted && data?.data) {
-          const hydrated = hydrateState(data.data);
-          setState(hydrated);
-          try { localStorage.setItem(KEY, JSON.stringify(hydrated)); } catch (e) {}
-          setCloudStatus('online');
-        } else if (mounted) {
-          // No row yet — seed it with initialState (or local data if present).
-          let seed = initialState;
-          try { const raw = localStorage.getItem(KEY); if (raw) seed = hydrateState(JSON.parse(raw)); } catch (e) {}
-          await supabase.from('app_state').upsert({ id: ROW_ID, data: seed });
-          setState(seed);
-          setCloudStatus('online');
-        }
-      } catch (e) {
-        console.error('Supabase load failed, using local data:', e);
-        try {
-          const raw = localStorage.getItem(KEY);
-          if (mounted && raw) setState(hydrateState(JSON.parse(raw)));
-        } catch (e2) { /* first run, nothing saved anywhere */ }
-        if (mounted) setCloudStatus('offline');
-      } finally {
-        if (mounted) setLoaded(true);
-      }
+      const prof = await getSessionProfile();
+      if (mounted) setSessionRaw(prof);
+      if (prof) await refresh();
+      if (mounted) setLoaded(true);
     })();
-    return () => { mounted = false; };
-  }, []);
+    const { data: sub } = supabase.auth.onAuthStateChange(async (_event, sess) => {
+      if (!mounted) return;
+      if (!sess) { setSessionRaw(null); return; }
+      const prof = await getSessionProfile();
+      setSessionRaw(prof);
+      if (prof) await refresh();
+    });
+    return () => { mounted = false; sub?.subscription?.unsubscribe(); };
+  }, [refresh]);
 
-  // Poll periodically so changes made on other devices show up here too.
+  // Realtime αντί για polling: η αλλαγή άλλης συσκευής φτάνει αμέσως.
   useEffect(() => {
-    if (!loaded) return;
-    const interval = setInterval(async () => {
-      // Skip a poll that lands right after our own write, so it can't clobber it.
-      if (Date.now() - lastWriteRef.current < POLL_MS) return;
-      try {
-        const { data, error } = await supabase.from('app_state').select('data').eq('id', ROW_ID).single();
-        if (error) throw error;
-        if (data?.data) {
-          setState(prev => {
-            const hydrated = hydrateState(data.data);
-            const nextStr = JSON.stringify(hydrated);
-            if (nextStr === JSON.stringify(prev)) return prev;
-            try { localStorage.setItem(KEY, nextStr); } catch (e) {}
-            return hydrated;
-          });
-        }
-        setCloudStatus('online');
-      } catch (e) {
-        setCloudStatus('offline');
-      }
-    }, POLL_MS);
-    return () => clearInterval(interval);
-  }, [loaded]);
+    if (!session) return;
+    const unsub = subscribeToChanges(() => {
+      if (savingRef.current) return; // δικό μας γράψιμο, το ξέρουμε ήδη
+      refresh();
+    });
+    return unsub;
+  }, [session, refresh]);
 
+  // Γράφει ΜΟΝΟ ό,τι άλλαξε. Αν αποτύχει, επαναφέρει την οθόνη στα αληθινά
+  // δεδομένα αντί να αφήσει τον χρήστη να βλέπει αλλαγή που δεν αποθηκεύτηκε.
   const persist = useCallback(async (next) => {
+    const before = stateRef.current;
     setState(next);
-    lastWriteRef.current = Date.now();
-    try { localStorage.setItem(KEY, JSON.stringify(next)); } catch (e) { console.error('storage error', e); }
+    savingRef.current = true;
     try {
-      const { error } = await supabase.from('app_state').upsert({ id: ROW_ID, data: next });
-      if (error) throw error;
+      await saveDiff(before, next);
+      stateRef.current = next;
       setCloudStatus('online');
     } catch (e) {
-      console.error('Supabase save failed, kept locally only:', e);
+      console.error('Save failed:', e);
       setCloudStatus('offline');
+      alert('Η αλλαγή δεν αποθηκεύτηκε. Έλεγξε τη σύνδεσή σου και δοκίμασε ξανά.');
+      await refresh();
+    } finally {
+      savingRef.current = false;
     }
+  }, [refresh]);
+
+  const handleLogout = useCallback(async () => {
+    await signOut();
+    setSessionRaw(null);
   }, []);
 
   if (!loaded) {
@@ -579,19 +564,17 @@ export default function TaxiFleetApp() {
   }
 
   if (!session) {
-    return <LoginScreen state={state} persist={persist} drivers={state.drivers} adminUsername={state.adminUsername} adminPassword={state.adminPassword} onLogin={setSession} />;
+    return <LoginScreen />;
   }
 
   if (session.role === 'driver') {
-    const driverExists = state.drivers.some(d => d.id === session.driverId);
-    if (!driverExists) {
-      setSession(null);
-      return <LoginScreen state={state} persist={persist} drivers={state.drivers} adminUsername={state.adminUsername} adminPassword={state.adminPassword} onLogin={setSession} />;
+    if (!session.driverId) {
+      return <LoginScreen notice="Ο λογαριασμός δεν είναι συνδεδεμένος με οδηγό. Επικοινώνησε με τον διαχειριστή." />;
     }
-    return <DriverApp state={state} persist={persist} driverId={session.driverId} onLogout={() => setSession(null)} cloudStatus={cloudStatus} />;
+    return <DriverApp state={state} persist={persist} driverId={session.driverId} onLogout={handleLogout} cloudStatus={cloudStatus} />;
   }
 
-  return <AdminApp state={state} persist={persist} onLogout={() => setSession(null)} cloudStatus={cloudStatus} />;
+  return <AdminApp state={state} persist={persist} onLogout={handleLogout} cloudStatus={cloudStatus} />;
 }
 
 const DAY_NAMES_GEN = ['Κυριακή', 'Δευτέρα', 'Τρίτη', 'Τετάρτη', 'Πέμπτη', 'Παρασκευή', 'Σάββατο'];
@@ -627,100 +610,73 @@ function CloudBadge({ status }) {
 }
 
 // ================= LOGIN =================
-function LoginScreen({ state, persist, drivers, adminUsername, adminPassword, onLogin }) {
-  const [mode, setMode] = useState(null); // 'driver' | 'admin'
-  const [username, setUsername] = useState('');
+function LoginScreen({ notice }) {
+  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [checking, setChecking] = useState(false);
 
-  const submitDriver = async () => {
-    const d = drivers.find(x => x.username === username.trim().toLowerCase());
-    if (!d) { setError('Λάθος όνομα χρήστη ή κωδικός'); return; }
+  const submit = async () => {
+    if (!email.trim() || !password) { setError('Συμπλήρωσε email και κωδικό.'); return; }
     setChecking(true);
-    let ok = await pwVerify(d.password, password);
-    if (!ok && d.password === password) {
-      // Legacy plain-text account — the guess matches the raw stored value.
-      // Log them in, and quietly upgrade this one account to encrypted storage.
-      ok = true;
-      const ciphertext = await pwEncrypt(password);
-      await persist({ ...state, drivers: state.drivers.map(x => x.id === d.id ? { ...x, password: ciphertext } : x) });
+    setError('');
+    try {
+      await signIn(email, password);
+      // Η επιτυχής σύνδεση ενημερώνει μόνη της την εφαρμογή (onAuthStateChange).
+    } catch (e) {
+      setError(e?.message === 'Invalid login credentials'
+        ? 'Λάθος email ή κωδικός.'
+        : 'Η σύνδεση απέτυχε. Έλεγξε τη σύνδεσή σου στο ίντερνετ.');
+      setChecking(false);
     }
-    setChecking(false);
-    if (!ok) { setError('Λάθος όνομα χρήστη ή κωδικός'); return; }
-    onLogin({ role: 'driver', driverId: d.id });
-  };
-
-  const submitAdmin = async () => {
-    if (username.trim().toLowerCase() !== adminUsername.trim().toLowerCase()) {
-      setError('Λάθος στοιχεία διαχειριστή');
-      return;
-    }
-    setChecking(true);
-    let ok = await pwVerify(adminPassword, password);
-    if (!ok && adminPassword === password) {
-      ok = true;
-      const ciphertext = await pwEncrypt(password);
-      await persist({ ...state, adminPassword: ciphertext });
-    }
-    setChecking(false);
-    if (!ok) { setError('Λάθος στοιχεία διαχειριστή'); return; }
-    onLogin({ role: 'admin' });
   };
 
   return (
-    <div style={{ minHeight: '100vh', background: BG, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 24, ...fontStack }}>
-      <div style={{ width: '100%', maxWidth: 380 }}>
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6, marginBottom: 32 }}>
-          <img src="/logo-yellow.png" alt="Taxi Thessaloniki.GR" style={{ maxHeight: 90, maxWidth: '70vw', width: 'auto', height: 'auto' }} />
-          <div style={{ color: MUTE, fontSize: 13 }}>Σύνδεση</div>
+    <div style={{ minHeight: '100vh', background: BG, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20, ...fontStack }}>
+      <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 16, padding: 28, width: '100%', maxWidth: 380 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
+          <Car size={22} color={ACCENT} />
+          <div style={{ color: TEXT, fontSize: 19, fontWeight: 800 }}>Taxi Thessaloniki.Gr</div>
         </div>
+        <div style={{ color: MUTE, fontSize: 13, marginBottom: 20 }}>Σύνδεση με το email του λογαριασμού σου</div>
 
-        {!mode ? (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-            <button onClick={() => { setMode('driver'); setError(''); }} style={btnPrimary}>
-              <span style={{ display: 'flex', alignItems: 'center', gap: 10 }}><User size={20} /> Σύνδεση οδηγού</span>
-              <ChevronRight size={20} />
-            </button>
-            <button onClick={() => { setMode('admin'); setError(''); }} style={btnSecondary}>
-              <span style={{ display: 'flex', alignItems: 'center', gap: 10 }}><Gauge size={20} /> Σύνδεση διαχειριστή</span>
-              <ChevronRight size={20} />
-            </button>
-          </div>
-        ) : (
-          <div>
-            <button onClick={() => { setMode(null); setUsername(''); setPassword(''); setError(''); }} style={btnBack}>
-              <ArrowLeft size={16} /> Πίσω
-            </button>
-            <label style={label}>Όνομα χρήστη</label>
-            <input value={username} onChange={e => setUsername(e.target.value)} style={input} placeholder={mode === 'admin' ? 'admin' : 'π.χ. giorgos'} />
-            <label style={label}>Κωδικός</label>
-            <input type="password" value={password} onChange={e => setPassword(e.target.value)} style={{ ...input, marginBottom: 8 }} onKeyDown={e => e.key === 'Enter' && (mode === 'driver' ? submitDriver() : submitAdmin())} />
-            {error && <div style={{ color: RED, fontSize: 13, marginBottom: 12 }}>{error}</div>}
-            <button
-              onClick={mode === 'driver' ? submitDriver : submitAdmin}
-              disabled={checking}
-              style={{ ...btnPrimary, justifyContent: 'center', marginTop: 8, opacity: checking ? 0.6 : 1, cursor: checking ? 'not-allowed' : 'pointer' }}
-            >
-              {checking ? 'Έλεγχος...' : 'Σύνδεση'}
-            </button>
-            {mode === 'driver' && (
-              <div style={{ height: 4 }} />
-            )}
+        {notice && (
+          <div style={{ background: 'rgba(193,84,60,0.12)', border: `1px solid ${RED}`, color: TEXT, fontSize: 13, borderRadius: 10, padding: 12, marginBottom: 16 }}>
+            {notice}
           </div>
         )}
+
+        <input
+          type="email" value={email} autoComplete="username" inputMode="email"
+          onChange={e => setEmail(e.target.value)}
+          placeholder="email"
+          style={{ width: '100%', background: BG, border: `1px solid ${BORDER}`, borderRadius: 10, padding: '12px 14px', color: TEXT, fontSize: 15, marginBottom: 10, boxSizing: 'border-box' }}
+        />
+        <input
+          type="password" value={password} autoComplete="current-password"
+          onChange={e => setPassword(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') submit(); }}
+          placeholder="κωδικός"
+          style={{ width: '100%', background: BG, border: `1px solid ${BORDER}`, borderRadius: 10, padding: '12px 14px', color: TEXT, fontSize: 15, marginBottom: 14, boxSizing: 'border-box' }}
+        />
+
+        {error && <div style={{ color: RED, fontSize: 13, marginBottom: 12 }}>{error}</div>}
+
+        <button
+          onClick={submit} disabled={checking}
+          style={{ width: '100%', background: ACCENT, border: 'none', borderRadius: 10, padding: '13px 0', color: '#1C2128', fontSize: 15, fontWeight: 800, cursor: checking ? 'default' : 'pointer', opacity: checking ? 0.6 : 1 }}
+        >
+          {checking ? 'Σύνδεση…' : 'Σύνδεση'}
+        </button>
+
+        <div style={{ color: MUTE, fontSize: 12, marginTop: 16, lineHeight: 1.6 }}>
+          Ξέχασες τον κωδικό σου; Ζήτα από τον διαχειριστή να τον αλλάξει.
+        </div>
       </div>
     </div>
   );
 }
 
-const btnPrimary = { background: ACCENT, color: BG, border: 'none', borderRadius: 14, padding: 20, fontSize: 16, fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', boxSizing: 'border-box' };
-const btnSecondary = { background: CARD, color: TEXT, border: `1px solid ${BORDER}`, borderRadius: 14, padding: 20, fontSize: 16, fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', boxSizing: 'border-box' };
-const btnBack = { background: 'none', border: 'none', color: MUTE, display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', marginBottom: 20, fontSize: 14, padding: 0 };
-const label = { color: MUTE, fontSize: 13, display: 'block', marginBottom: 6 };
-const input = { width: '100%', background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 14, color: TEXT, fontSize: 15, marginBottom: 16, boxSizing: 'border-box', fontFamily: 'inherit' };
-
-// ================= DRIVER APP =================
 function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
   const driver = state.drivers.find(d => d.id === driverId);
   const activeShift = state.shifts.find(s => s.driverId === driverId && s.status === 'active');
@@ -3010,126 +2966,32 @@ function FleetTab({ state, persist }) {
   );
 }
 
-function RevealPasswordButton({ state, persist, ciphertext }) {
-  const [revealed, setRevealed] = useState(null); // plaintext string, or null
-  const [asking, setAsking] = useState(false);
-  const [adminPw, setAdminPw] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-
-  if (revealed !== null) {
-    return (
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-        <span style={{ color: TEXT, fontSize: 13, fontWeight: 600, fontFamily: 'monospace' }}>{revealed}</span>
-        <button onClick={() => setRevealed(null)} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer', display: 'flex', padding: 2 }} title="Απόκρυψη">
-          <EyeOff size={16} />
-        </button>
-      </div>
-    );
-  }
-
-  if (asking) {
-    return (
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-        <input
-          type="password" value={adminPw} onChange={e => setAdminPw(e.target.value)}
-          placeholder="Ο δικός σου κωδικός" autoFocus
-          style={{ ...input, marginBottom: 0, width: 130, padding: '5px 8px', fontSize: 12 }}
-        />
-        <button
-          disabled={busy || !adminPw}
-          onClick={async () => {
-            setBusy(true);
-            const res = await pwReveal(ciphertext, state.adminPassword, adminPw);
-            setBusy(false);
-            if (res.ok) {
-              setRevealed(res.plaintext);
-              setAsking(false);
-              setAdminPw('');
-              setError('');
-              // Opportunistic self-heal: now that we know this password is correct,
-              // make sure it's actually stored encrypted (covers accounts still logged
-              // in from before this feature existed, who never re-logged-in to migrate).
-              if (persist) {
-                pwEncrypt(adminPw).then(ciphertextNow => {
-                  persist({ ...state, adminPassword: ciphertextNow });
-                });
-              }
-            } else {
-              setError('Λάθος κωδικός');
-            }
-          }}
-          style={smallBtn(ACCENT)}
-        >
-          OK
-        </button>
-        {error && <span style={{ color: RED, fontSize: 11 }}>{error}</span>}
-      </div>
-    );
-  }
-
+// Οι κωδικοί δεν αποθηκεύονται πλέον στην εφαρμογή — τους διαχειρίζεται το
+// Supabase Auth. Δεν υπάρχει τρόπος (ούτε πρέπει) να εμφανιστεί κωδικός χρήστη.
+function RevealPasswordButton() {
   return (
-    <button onClick={() => setAsking(true)} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer', display: 'flex', padding: 2 }} title="Εμφάνιση (απαιτεί τον δικό σου κωδικό)">
-      <Eye size={16} />
-    </button>
+    <span style={{ color: MUTE, fontSize: 12 }}>
+      Διαχείριση από το Supabase
+    </span>
   );
 }
 
-function AdminAccountModal({ state, persist, onClose }) {
-  const [currentPassword, setCurrentPassword] = useState('');
-  const [newUsername, setNewUsername] = useState(state.adminUsername);
-  const [newPassword, setNewPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState(false);
-
-  const submit = async () => {
-    setError('');
-    if (!newUsername.trim()) { setError('Το όνομα χρήστη δεν μπορεί να είναι κενό.'); return; }
-    if (newPassword && newPassword !== confirmPassword) { setError('Οι νέοι κωδικοί δεν ταιριάζουν.'); return; }
-    setBusy(true);
-    const ok = await pwVerify(state.adminPassword, currentPassword);
-    if (!ok) { setBusy(false); setError('Λάθος τρέχων κωδικός.'); return; }
-    const nextPassword = newPassword ? await pwEncrypt(newPassword) : state.adminPassword;
-    await persist({ ...state, adminUsername: newUsername.trim(), adminPassword: nextPassword });
-    setBusy(false);
-    onClose();
-  };
-
+function AdminAccountModal({ onClose }) {
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: 20 }}>
-      <div style={{ background: BG, border: `1px solid ${BORDER}`, borderRadius: 16, padding: 24, width: '100%', maxWidth: 400 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
-          <div style={{ color: TEXT, fontSize: 17, fontWeight: 700 }}>Στοιχεία σύνδεσης διαχειριστή</div>
-          <button onClick={onClose} style={{ background: 'none', border: 'none', color: MUTE, cursor: 'pointer' }}><X size={20} /></button>
+      <div style={{ background: BG, border: `1px solid ${BORDER}`, borderRadius: 16, padding: 24, width: '100%', maxWidth: 420 }}>
+        <div style={{ color: TEXT, fontSize: 17, fontWeight: 700, marginBottom: 10 }}>Λογαριασμός</div>
+        <div style={{ color: MUTE, fontSize: 13, lineHeight: 1.7, marginBottom: 18 }}>
+          Τα στοιχεία σύνδεσης δεν αποθηκεύονται πλέον στην εφαρμογή. Για αλλαγή
+          κωδικού ή δημιουργία λογαριασμού για νέο οδηγό, μπες στο Supabase →
+          Authentication → Users.
         </div>
-
-        <div style={{ background: CARD, borderRadius: 10, padding: 14, marginBottom: 20, border: `1px solid ${BORDER}` }}>
-          <div style={{ color: MUTE, fontSize: 11, marginBottom: 8 }}>ΤΡΕΧΟΝΤΑ ΣΤΟΙΧΕΙΑ</div>
-          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
-            <span style={{ color: MUTE, fontSize: 13 }}>Όνομα χρήστη</span>
-            <span style={{ color: TEXT, fontSize: 13, fontWeight: 600 }}>{state.adminUsername}</span>
-          </div>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span style={{ color: MUTE, fontSize: 13 }}>Κωδικός</span>
-            <RevealPasswordButton state={state} persist={persist} ciphertext={state.adminPassword} />
-          </div>
-        </div>
-
-        <label style={label}>Τρέχων κωδικός (για επιβεβαίωση)</label>
-        <input type="password" value={currentPassword} onChange={e => setCurrentPassword(e.target.value)} style={input} />
-
-        <label style={label}>Νέο όνομα χρήστη</label>
-        <input value={newUsername} onChange={e => setNewUsername(e.target.value)} style={input} />
-
-        <label style={label}>Νέος κωδικός (άφησέ το κενό για να μείνει ο ίδιος)</label>
-        <input type="password" value={newPassword} onChange={e => setNewPassword(e.target.value)} style={input} />
-
-        <label style={label}>Επιβεβαίωση νέου κωδικού</label>
-        <input type="password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} style={input} />
-
-        {error && <div style={{ color: RED, fontSize: 13, marginBottom: 12 }}>{error}</div>}
-        <button onClick={submit} disabled={busy} style={{ ...btnPrimary, justifyContent: 'center', opacity: busy ? 0.6 : 1 }}>{busy ? 'Έλεγχος...' : 'Αποθήκευση'}</button>
+        <button
+          onClick={onClose}
+          style={{ width: '100%', background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: '11px 0', color: TEXT, fontSize: 14, fontWeight: 700, cursor: 'pointer' }}
+        >
+          Κλείσιμο
+        </button>
       </div>
     </div>
   );
@@ -3144,11 +3006,12 @@ function DriverEditModal({ state, persist, driver, cars, existingUsernames, onCl
   const [busy, setBusy] = useState(false);
 
   const submit = async () => {
-    if (!name || !username || (!driver && !password) || !car) { setError('Συμπλήρωσε όλα τα πεδία.'); return; }
+    if (!name || !username || !car) { setError('Συμπλήρωσε όλα τα πεδία.'); return; }
     if (existingUsernames.includes(username.trim().toLowerCase())) { setError('Το όνομα χρήστη υπάρχει ήδη.'); return; }
     setBusy(true);
     const payload = { id: driver?.id, name, username: username.trim().toLowerCase(), car };
-    if (password) payload.password = await pwEncrypt(password); // omitted entirely when left blank on edit — keeps the existing one
+    // Ο κωδικός δεν ανήκει πια εδώ: ο λογαριασμός του οδηγού φτιάχνεται
+    // στο Supabase → Authentication, και συνδέεται μέσω του profiles.
     setBusy(false);
     onSave(payload);
   };
