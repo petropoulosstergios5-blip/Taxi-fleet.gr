@@ -2881,7 +2881,9 @@ function FleetTab({ state, persist }) {
       await persist({ ...state, drivers: state.drivers.map(d => d.id === payload.id ? { ...d, ...payload } : d) });
     } else {
       const id = 'd_' + Date.now();
-      await persist({ ...state, drivers: [...state.drivers, { id, ...payload }] });
+      // Το payload φέρνει id: undefined για νέο οδηγό. Πρέπει να απλωθεί ΠΡΙΝ το id,
+      // αλλιώς σβήνει το id που μόλις φτιάχτηκε και ο οδηγός αποθηκεύεται χωρίς ταυτότητα.
+      await persist({ ...state, drivers: [...state.drivers, { ...payload, id }] });
     }
     setEditingDriver(null);
   };
