@@ -677,6 +677,13 @@ function LoginScreen({ notice }) {
   );
 }
 
+// Κοινά στυλ κουμπιών και φορμών, σε χρήση σε όλη την εφαρμογή.
+const btnPrimary = { background: ACCENT, color: BG, border: 'none', borderRadius: 14, padding: 20, fontSize: 16, fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', boxSizing: 'border-box' };
+const btnSecondary = { background: CARD, color: TEXT, border: `1px solid ${BORDER}`, borderRadius: 14, padding: 20, fontSize: 16, fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', boxSizing: 'border-box' };
+const btnBack = { background: 'none', border: 'none', color: MUTE, display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', marginBottom: 20, fontSize: 14, padding: 0 };
+const label = { color: MUTE, fontSize: 13, display: 'block', marginBottom: 6 };
+const input = { width: '100%', background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 14, color: TEXT, fontSize: 15, marginBottom: 16, boxSizing: 'border-box', fontFamily: 'inherit' };
+
 function DriverApp({ state, persist, driverId, onLogout, cloudStatus }) {
   const driver = state.drivers.find(d => d.id === driverId);
   const activeShift = state.shifts.find(s => s.driverId === driverId && s.status === 'active');
