@@ -9,7 +9,28 @@
 import { createClient } from '@supabase/supabase-js';
 
 const SUPABASE_URL = 'https://whecwstuqlyohbvuvfkp.supabase.co';
-const SUPABASE_ANON_KEY = import.meta.env?.VITE_SUPABASE_ANON_KEY || window.__SUPABASE_ANON_KEY__;
+// Το κλειδί έρχεται από μεταβλητή περιβάλλοντος. Δοκιμάζονται και οι δύο
+// συμβάσεις (Vite και Create React App) ώστε να μην εξαρτάται από το build tool.
+function readAnonKey() {
+  try {
+    if (import.meta && import.meta.env && import.meta.env.VITE_SUPABASE_ANON_KEY) {
+      return import.meta.env.VITE_SUPABASE_ANON_KEY;
+    }
+  } catch (e) { /* δεν είναι Vite */ }
+  if (typeof process !== 'undefined' && process.env && process.env.REACT_APP_SUPABASE_ANON_KEY) {
+    return process.env.REACT_APP_SUPABASE_ANON_KEY;
+  }
+  if (typeof window !== 'undefined' && window.__SUPABASE_ANON_KEY__) {
+    return window.__SUPABASE_ANON_KEY__;
+  }
+  throw new Error(
+    'Λείπει το anon key. Όρισε VITE_SUPABASE_ANON_KEY (Vite) ή ' +
+    'REACT_APP_SUPABASE_ANON_KEY (CRA) στις μεταβλητές περιβάλλοντος του Vercel.'
+  );
+}
+
+export const SUPABASE_ANON_KEY = readAnonKey();
+export { SUPABASE_URL };
 
 export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
@@ -84,6 +105,9 @@ export async function loadState() {
     appointments, schedule, messages, tameio, audit].find(r => r.error);
   if (firstError) throw firstError.error;
 
+  const prof = await getSessionProfile();
+  const profileName = prof?.name || prof?.email || 'admin';
+
   const posByDriver = new Map((positions.data || []).map(p => [p.driver_id, p]));
   const serviceByCar = new Map();
   (service.data || []).forEach(h => {
@@ -149,6 +173,9 @@ export async function loadState() {
       id: t.id, driverId: t.driver_id, amount: Number(t.amount) || 0, reason: t.reason, at: t.at,
     })),
     auditLog: (audit.data || []).map(l => ({ id: l.id, at: l.at, actor: l.actor, action: l.action })),
+    // Συμβατότητα: το UI χρησιμοποιεί το adminUsername ως «ποιος έκανε την
+    // ενέργεια» στο ιστορικό. Πλέον έρχεται από τον συνδεδεμένο λογαριασμό.
+    adminUsername: profileName,
     reportsResetAt: settings.data?.reports_reset_at || null,
     fareSettings: {
       flagFall: Number(settings.data?.fare_flag_fall) || 1.90,
